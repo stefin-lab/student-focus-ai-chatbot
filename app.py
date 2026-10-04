@@ -1,702 +1,168 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
 import re
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 
-# ============================================================
-# PAGE CONFIGURATION
-# ============================================================
-
-st.set_page_config(
-    page_title="Student Focus AI Chatbot",
-    page_icon="🎓",
-    layout="centered"
-)
-
-# ============================================================
-# TITLE
-# ============================================================
-
-st.title("🎓 Student Focus AI Chatbot")
-st.caption("AI-powered study pattern analysis and personalized recommendations")
-
-# ============================================================
-# GENERATE TRAINING DATA
-# ============================================================
+st.set_page_config(page_title="Student Focus AI Chatbot", page_icon="🎓", layout="wide")
 
 @st.cache_data
-def generate_data():
-
+def make_data():
     np.random.seed(42)
-
-    subjects = [
-        "Python",
-        "Artificial Intelligence",
-        "Machine Learning",
-        "DBMS",
-        "Mathematics",
-        "Data Structures"
-    ]
-
-    rows = []
-
+    subjects=["Python","Artificial Intelligence","Machine Learning","DBMS","Mathematics","Data Structures"]
+    rows=[]
     for i in range(1000):
+        subject=np.random.choice(subjects); duration=np.random.randint(20,121); br=np.random.randint(5,31)
+        hour=np.random.randint(6,24); dis=np.random.randint(0,11); sleep=round(np.random.uniform(4.5,9),1); prev=np.random.randint(40,101)
+        s=min(duration/30,4)+sleep*.35+prev*.025-dis*.35+(1.5 if 17<=hour<=21 else 0)-(0.8 if duration>100 else 0)+np.random.normal(0,1)
+        focus=int(np.clip(round(s/2),1,5)); rows.append([i+1,subject,duration,br,hour,dis,sleep,prev,focus])
+    return pd.DataFrame(rows,columns=["student_id","subject","study_duration","break_duration","study_hour","distractions","sleep_hours","previous_score","focus_level"])
 
-        subject = np.random.choice(subjects)
+data=make_data()
+FEATURES=["study_duration","break_duration","study_hour","distractions","sleep_hours","previous_score"]
+X=data[FEATURES]; y=data.focus_level
+Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,random_state=42)
+@st.cache_resource
+def get_model(a,b):
+    m=RandomForestClassifier(n_estimators=150,random_state=42); m.fit(a,b); return m
+model=get_model(Xtr,ytr); accuracy=accuracy_score(yte,model.predict(Xte))
 
-        study_duration = np.random.randint(20, 121)
+if "chat" not in st.session_state: st.session_state.chat=[]
+if "history" not in st.session_state: st.session_state.history=[]
 
-        break_duration = np.random.randint(5, 31)
+def level(n): return {1:"Very Low",2:"Low",3:"Moderate",4:"High",5:"Very High"}.get(int(n),"Unknown")
+def score(n): return int(round(int(n)*20))
+def best_time(df):
+    h=int(df.groupby("study_hour").focus_level.mean().idxmax()); return f"{h if 1<=h<=12 else (h-12 if h>12 else 12)}:00 {'AM' if h<12 else 'PM'}"
+def recs(f,d,s,t,h):
+    r=[]
+    r.append("🔴 Focus is low. Try 25–30 minute focused sessions." if f<=2 else "🟡 Focus is moderate. Try 40–50 minute sessions." if f==3 else "🟢 Focus is strong. Continue your current routine.")
+    r.append("📵 Distractions are high. Keep your phone away." if d>=5 else "📱 Reduce notifications and unnecessary screen activity." if d>=3 else "✅ Distraction level is under control.")
+    r.append("😴 Sleep is low. Aim for a consistent sleep routine." if s<6 else "🌙 Try to increase sleep toward 7–8 hours." if s<7 else "😴 Sleep duration is in a good range.")
+    if t>100:r.append("⏱️ Session is long. Take a short break before continuing.")
+    if 17<=h<=21:r.append("⭐ This is within the stronger study period found in the training data.")
+    return r
 
-        study_hour = np.random.randint(6, 24)
+def parse(text):
+    x=text.lower()
+    def num(patterns,default=None,typ=float):
+        for p in patterns:
+            m=re.search(p,x,re.I)
+            if m:
+                try:return typ(m.group(1))
+                except:pass
+        return default
+    duration=num([r"(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)\s*(?:of\s*)?(?:study|studied|studying)?",r"(?:study|studied|studying)\s*(?:for\s*)?(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)"],None)
+    h=None
+    m=re.search(r"(?:at|around)\s*(\d{1,2})(?::\d{2})?\s*(am|pm)?",x)
+    if m:
+        h=int(m.group(1)); ap=m.group(2)
+        if ap=="pm" and h<12:h+=12
+        if ap=="am" and h==12:h=0
+    dis=num([r"(\d+)\s*distractions?"],None,int)
+    sleep=num([r"(?:slept|sleep|sleeping)\s*(?:for\s*)?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)"],None)
+    prev=num([r"(?:previous|last|score|mark|marks)\s*(?:score|mark|marks)?\s*(?:was|is|of)?\s*(\d+(?:\.\d+)?)\s*(?:%|percent)?"],75)
+    subs=["python","artificial intelligence","machine learning","dbms","mathematics","data structures"]
+    subject=next((s.title() for s in subs if s in x),"General Study")
+    if duration is not None and h is not None and dis is not None and sleep is not None:
+        return dict(duration=float(duration),break_duration=10.,hour=max(0,min(23,h)),distractions=int(dis),sleep=float(sleep),previous_score=max(0,min(100,float(prev))),subject=subject)
 
-        distractions = np.random.randint(0, 11)
+def analyze(s,save=True):
+    inp=pd.DataFrame([[s["duration"],s["break_duration"],s["hour"],s["distractions"],s["sleep"],s["previous_score"]]],columns=FEATURES)
+    p=int(model.predict(inp)[0]); conf=float(model.predict_proba(inp).max()*100); s=dict(s,focus_level=p,focus_score=score(p),confidence=conf)
+    if save: st.session_state.history.append(s)
+    return s
 
-        sleep_hours = round(
-            np.random.uniform(4.5, 9),
-            1
-        )
+def bot(text):
+    p=parse(text)
+    if p:
+        r=analyze(p)
+        out=f"### 🎯 Study Session Analysis\n\n**Subject:** {r['subject']}  \n**Focus Score:** **{r['focus_score']}/100**  \n**Focus Level:** **{level(r['focus_level'])}**  \n**Model Confidence:** **{r['confidence']:.1f}%**\n\n### 💡 Recommendations\n"
+        return out+"\n".join("- "+x for x in recs(r['focus_level'],r['distractions'],r['sleep'],r['duration'],r['hour']))+"\n\n📌 Session added to Study History."
+    x=text.lower()
+    if any(w in x for w in ["hello","hi","hey"]): return "👋 Hello! I'm your Student Focus AI Assistant. Tell me about your study session or ask about study time, distractions, subjects, or planning."
+    if "best study" in x or "productive" in x or "study time" in x:return f"⭐ A strong study period in the training data is around **{best_time(data)}**."
+    if "distract" in x or "phone" in x:return "📵 Keep your phone away, disable unnecessary notifications, use 25–50 minute focus blocks, and take planned breaks."
+    if "subject" in x or "priority" in x:
+        q=priority(data).iloc[0]; return f"📚 Current priority suggestion: **{q.subject}**\n\nAverage score: **{q.avg_score:.1f}%**  \nAverage focus: **{q.avg_focus:.1f}/5**"
+    if "help" in x or "what can" in x:return "🤖 I can predict focus, give recommendations, find a study time, analyze distractions, prioritize subjects, create study plans, track history, and generate a daily report."
+    return "💬 Try: **I studied Python for 60 minutes at 7 pm with 2 distractions and slept 7 hours.**"
 
-        previous_score = np.random.randint(40, 101)
+def priority(df):
+    q=df.groupby("subject").agg(avg_score=("previous_score","mean"),avg_focus=("focus_level","mean"),study_time=("study_duration","mean")).reset_index()
+    q["priority_score"]=(100-q.avg_score)*.55+(5-q.avg_focus)*10
+    return q.sort_values("priority_score",ascending=False)
 
-        # Calculate synthetic focus pattern
-        score = 0
+st.sidebar.title("🎓 Student Focus AI")
+menu=st.sidebar.radio("Navigate",["🤖 AI Chatbot","🔮 Focus Prediction","📈 Study Analytics","📚 Subject Priority","📅 Study Planner","📋 Study History","📄 Daily Report","📥 Download Data"])
+st.sidebar.markdown("---")
+st.sidebar.write("**Algorithm:** Random Forest Classifier")
+st.sidebar.write(f"**Training Samples:** {len(Xtr)}")
+st.sidebar.write(f"**Testing Samples:** {len(Xte)}")
+st.sidebar.write(f"**Test Accuracy:** {accuracy*100:.2f}%")
+if st.sidebar.button("🗑️ Clear Study History"): st.session_state.history=[]; st.rerun()
 
-        score += min(study_duration / 30, 4)
+if menu=="🤖 AI Chatbot":
+    st.title("🎓 Student Focus AI Chatbot"); st.caption("AI-powered study pattern analysis and personalized recommendations")
+    if not st.session_state.chat: st.info("👋 Hello! Example: **I studied Python for 60 minutes at 7 pm with 2 distractions and slept 7 hours.**")
+    for role,msg in st.session_state.chat:
+        with st.chat_message(role):st.markdown(msg)
+    prompt=st.chat_input("Tell me about your study session...")
+    if prompt:
+        st.session_state.chat.append(("user",prompt)); st.session_state.chat.append(("assistant",bot(prompt))); st.rerun()
 
-        score += sleep_hours * 0.35
+elif menu=="🔮 Focus Prediction":
+    st.header("🔮 AI Focus Prediction")
+    a,b=st.columns(2)
+    with a: dur=st.number_input("Study Duration (minutes)",5,300,60); br=st.number_input("Break Duration (minutes)",0,120,10); hr=st.slider("Study Hour",0,23,19)
+    with b: dis=st.slider("Expected Distractions",0,20,2); sl=st.slider("Sleep Hours",1.,12.,7.,.5); ps=st.slider("Previous Score",0,100,75)
+    if st.button("🔮 Predict Focus",type="primary"):
+        r=analyze(dict(duration=float(dur),break_duration=float(br),hour=int(hr),distractions=int(dis),sleep=float(sl),previous_score=float(ps),subject="Manual Prediction"),save=False)
+        c1,c2,c3=st.columns(3); c1.metric("Focus Score",f"{r['focus_score']}/100"); c2.metric("Focus Level",level(r['focus_level'])); c3.metric("Confidence",f"{r['confidence']:.1f}%"); st.progress(r['focus_score']/100)
+        st.subheader("💡 Recommendations"); [st.write(x) for x in recs(r['focus_level'],dis,sl,dur,hr)]
 
-        score += previous_score * 0.025
+elif menu=="📈 Study Analytics":
+    st.header("📈 Study & Focus Analytics")
+    c1,c2,c3,c4=st.columns(4); c1.metric("Average Focus",f"{data.focus_level.mean():.2f}/5"); c2.metric("Average Study Time",f"{data.study_duration.mean():.1f} min"); c3.metric("Average Distractions",f"{data.distractions.mean():.1f}"); c4.metric("Average Sleep",f"{data.sleep_hours.mean():.1f} hrs")
+    q=data.focus_level.value_counts().sort_index().reset_index(); q.columns=["Focus Level","Count"]; st.plotly_chart(px.bar(q,x="Focus Level",y="Count",title="Focus Level Distribution"),use_container_width=True)
+    c1,c2=st.columns(2)
+    with c1:
+        h=data.groupby("study_hour").focus_level.mean().reset_index(); st.plotly_chart(px.line(h,x="study_hour",y="focus_level",markers=True,title="Average Focus by Study Time"),use_container_width=True)
+    with c2: st.plotly_chart(px.scatter(data,x="distractions",y="focus_level",color="subject",title="Distractions vs Focus"),use_container_width=True)
+    st.plotly_chart(px.scatter(data,x="sleep_hours",y="focus_level",color="subject",title="Sleep Duration vs Focus"),use_container_width=True)
+    st.success(f"⭐ Best study time from training data: **{best_time(data)}**")
 
-        score -= distractions * 0.35
+elif menu=="📚 Subject Priority":
+    st.header("📚 Subject Priority Analysis"); q=priority(data); st.dataframe(q.rename(columns={"subject":"Subject","avg_score":"Average Score","avg_focus":"Average Focus","study_time":"Average Study Time","priority_score":"Priority Score"}),use_container_width=True); st.plotly_chart(px.bar(q,x="subject",y="priority_score",title="Subject Priority"),use_container_width=True)
 
-        if 17 <= study_hour <= 21:
-            score += 1.5
+elif menu=="📅 Study Planner":
+    st.header("📅 Personalized Study Plan"); hours=st.slider("Available Study Time (hours)",1.,8.,3.,.5); text=st.text_input("Subjects","Python, Mathematics"); subs=[x.strip() for x in text.split(",") if x.strip()]
+    if st.button("✨ Generate Study Plan",type="primary"):
+        total=int(hours*60); rows=[]
+        for i,s in enumerate(subs): rows.append({"Order":i+1,"Subject":s,"Focus Time":f"{max(20,total//len(subs))} min","Break":"10 min" if i<len(subs)-1 else "Final review"})
+        st.dataframe(pd.DataFrame(rows),use_container_width=True); st.success("🎯 Put your most difficult subject in your strongest study period.")
 
-        if study_duration > 100:
-            score -= 0.8
-
-        score += np.random.normal(0, 1)
-
-        focus_level = int(
-            np.clip(
-                round(score / 2),
-                1,
-                5
-            )
-        )
-
-        rows.append([
-            subject,
-            study_duration,
-            break_duration,
-            study_hour,
-            distractions,
-            sleep_hours,
-            previous_score,
-            focus_level
-        ])
-
-    columns = [
-        "subject",
-        "study_duration",
-        "break_duration",
-        "study_hour",
-        "distractions",
-        "sleep_hours",
-        "previous_score",
-        "focus_level"
-    ]
-
-    return pd.DataFrame(
-        rows,
-        columns=columns
-    )
-
-
-data = generate_data()
-
-# ============================================================
-# TRAIN RANDOM FOREST MODEL
-# ============================================================
-
-features = [
-    "study_duration",
-    "break_duration",
-    "study_hour",
-    "distractions",
-    "sleep_hours",
-    "previous_score"
-]
-
-X = data[features]
-
-y = data["focus_level"]
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.20,
-    random_state=42,
-    stratify=y
-)
-
-model = RandomForestClassifier(
-    n_estimators=150,
-    random_state=42
-)
-
-model.fit(
-    X_train,
-    y_train
-)
-
-predictions = model.predict(X_test)
-
-accuracy = accuracy_score(
-    y_test,
-    predictions
-)
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def focus_name(level):
-
-    names = {
-        1: "Very Low",
-        2: "Low",
-        3: "Moderate",
-        4: "High",
-        5: "Very High"
-    }
-
-    return names.get(
-        int(level),
-        "Unknown"
-    )
-
-
-def extract_number(text, keywords, default=None):
-
-    for keyword in keywords:
-
-        pattern = rf"{keyword}\s*(?:is|of|:)?\s*(\d+(?:\.\d+)?)"
-
-        match = re.search(
-            pattern,
-            text.lower()
-        )
-
-        if match:
-            return float(match.group(1))
-
-    return default
-
-
-def extract_study_data(message):
-
-    text = message.lower()
-
-    # Study duration
-    duration = None
-
-    match = re.search(
-        r"(\d+(?:\.\d+)?)\s*(?:hours?|hrs?)",
-        text
-    )
-
-    if match:
-
-        duration = float(match.group(1)) * 60
-
+elif menu=="📋 Study History":
+    st.header("📋 Your Study History")
+    if not st.session_state.history: st.info("No sessions yet. Use the chatbot with a complete study-session message.")
     else:
-
-        match = re.search(
-            r"(\d+)\s*(?:minutes?|mins?)",
-            text
-        )
-
-        if match:
-            duration = float(
-                match.group(1)
-            )
-
-    # Break
-    break_time = extract_number(
-        text,
-        [
-            r"break",
-            r"break time"
-        ],
-        10
-    )
-
-    # Distractions
-    distractions = extract_number(
-        text,
-        [
-            r"distractions?",
-            r"distraction"
-        ],
-        2
-    )
-
-    # Sleep
-    sleep = extract_number(
-        text,
-        [
-            r"sleep",
-            r"slept"
-        ],
-        7
-    )
-
-    # Previous score
-    score = extract_number(
-        text,
-        [
-            r"score",
-            r"marks",
-            r"previous score"
-        ],
-        75
-    )
-
-    # Study hour
-    hour = None
-
-    time_match = re.search(
-        r"(\d{1,2})\s*(am|pm)",
-        text
-    )
-
-    if time_match:
-
-        hour = int(
-            time_match.group(1)
-        )
-
-        period = time_match.group(2)
-
-        if period == "pm" and hour != 12:
-            hour += 12
-
-        if period == "am" and hour == 12:
-            hour = 0
-
-    if hour is None:
-        hour = 19
-
-    return {
-        "duration": duration,
-        "break_time": break_time,
-        "hour": hour,
-        "distractions": distractions,
-        "sleep": sleep,
-        "score": score
-    }
-
-
-def predict_focus(info):
-
-    duration = info["duration"]
-
-    if duration is None:
-        duration = 60
-
-    input_data = pd.DataFrame(
-        [[
-            duration,
-            info["break_time"],
-            info["hour"],
-            info["distractions"],
-            info["sleep"],
-            info["score"]
-        ]],
-        columns=features
-    )
-
-    prediction = int(
-        model.predict(input_data)[0]
-    )
-
-    confidence = (
-        model.predict_proba(input_data).max()
-        * 100
-    )
-
-    return prediction, confidence
-
-
-def generate_response(message):
-
-    text = message.lower()
-
-    # Greeting
-    if any(word in text for word in [
-        "hello",
-        "hi",
-        "hey"
-    ]):
-
-        return (
-            "👋 Hello! I'm your **Student Focus AI Assistant**.\n\n"
-            "Tell me about your study session and I can analyze "
-            "your focus pattern.\n\n"
-            "For example:\n"
-            "> I studied Python for 60 minutes at 7 pm "
-            "with 2 distractions and slept 7 hours."
-        )
-
-    # Help
-    if "help" in text or "what can you do" in text:
-
-        return (
-            "🤖 I can help you with:\n\n"
-            "• 🎯 Predict your focus level\n"
-            "• 📊 Analyze your study pattern\n"
-            "• 🕐 Identify productive study times\n"
-            "• 📱 Analyze distractions\n"
-            "• 📚 Give subject-study recommendations\n"
-            "• 📅 Suggest a study strategy\n\n"
-            "Just describe your study session."
-        )
-
-    # Study time
-    if (
-        "best time" in text
-        or "study time" in text
-        or "when should i study" in text
-    ):
-
-        hourly = (
-            data.groupby("study_hour")["focus_level"]
-            .mean()
-        )
-
-        best_hour = int(
-            hourly.idxmax()
-        )
-
-        return (
-            f"🕐 Based on the available study-pattern data, "
-            f"the strongest recorded study period is around "
-            f"**{best_hour}:00**.\n\n"
-            "You can compare your own sessions over time "
-            "to see whether this pattern matches your experience."
-        )
-
-    # Subject priority
-    if (
-        "subject" in text
-        and (
-            "priority" in text
-            or "which subject" in text
-            or "need" in text
-        )
-    ):
-
-        grouped = data.groupby("subject").agg(
-            avg_score=("previous_score", "mean"),
-            avg_focus=("focus_level", "mean")
-        )
-
-        grouped["priority"] = (
-            (100 - grouped["avg_score"]) * 0.5
-            + (5 - grouped["avg_focus"]) * 10
-        )
-
-        subject = grouped["priority"].idxmax()
-
-        return (
-            f"📚 Based on the sample study data, "
-            f"**{subject}** has the highest calculated "
-            f"attention priority.\n\n"
-            "This priority is calculated from recorded score "
-            "and focus patterns."
-        )
-
-    # Distraction question
-    if "distraction" in text:
-
-        info = extract_study_data(message)
-
-        distractions = info["distractions"]
-
-        if distractions >= 5:
-
-            return (
-                f"📱 You reported about **{int(distractions)} "
-                "distractions**.\n\n"
-                "That's a relatively high distraction count "
-                "for this prediction. Try reducing notifications "
-                "and keeping your phone away during focused study."
-            )
-
-        elif distractions >= 3:
-
-            return (
-                f"📱 You reported about **{int(distractions)} "
-                "distractions**.\n\n"
-                "Try reducing unnecessary notifications and "
-                "interruptions."
-            )
-
-        else:
-
-            return (
-                f"✅ You reported about **{int(distractions)} "
-                "distractions**.\n\n"
-                "Your reported distraction level is relatively low."
-            )
-
-    # If message contains study information
-    info = extract_study_data(message)
-
-    has_study_data = (
-        info["duration"] is not None
-        or "studied" in text
-        or "study" in text
-        or "focus" in text
-        or "concentrate" in text
-    )
-
-    if has_study_data:
-
-        prediction, confidence = predict_focus(info)
-
-        response = (
-            "📊 **Study Pattern Analysis**\n\n"
-            f"🎯 Predicted Focus: **{prediction}/5**\n\n"
-            f"📌 Focus Category: **{focus_name(prediction)}**\n\n"
-            f"🤖 Model Confidence: **{confidence:.1f}%**\n\n"
-            "💡 **Recommendations:**\n"
-        )
-
-        for item in make_recommendations(
-            prediction,
-            info["distractions"],
-            info["sleep"],
-            info["duration"] or 60,
-            info["hour"]
-        ):
-
-            response += f"\n{item}"
-
-        return response
-
-    # Default response
-    return (
-        "🤔 I didn't get enough study information.\n\n"
-        "Try saying something like:\n\n"
-        "**I studied Python for 60 minutes at 7 pm, "
-        "had 2 distractions, slept 7 hours and scored 80.**"
-    )
-
-
-# ============================================================
-# CHATBOT RECOMMENDATIONS
-# ============================================================
-
-def make_recommendations(
-    focus,
-    distractions,
-    sleep,
-    duration,
-    hour
-):
-
-    result = []
-
-    if focus <= 2:
-
-        result.append(
-            "🔴 Your predicted focus is low. "
-            "Try shorter 25–30 minute study sessions."
-        )
-
-    elif focus == 3:
-
-        result.append(
-            "🟡 Your focus is moderate. "
-            "Try 40–50 minute focused sessions."
-        )
-
+        q=pd.DataFrame(st.session_state.history); q["Focus"]=q.focus_level.apply(level); st.dataframe(q[["subject","duration","hour","distractions","sleep","previous_score","focus_score","Focus"]],use_container_width=True); st.plotly_chart(px.line(q.reset_index(),x="index",y="focus_score",markers=True,title="Focus Score Progress"),use_container_width=True)
+        if len(q)>=2:
+            d=q.focus_score.iloc[-1]-q.focus_score.iloc[0]; st.success(f"📈 Focus improved by {d} points.") if d>0 else st.warning(f"📉 Focus is {abs(d)} points lower than the first session.") if d<0 else st.info("➡️ Focus is unchanged from the first session.")
+
+elif menu=="📄 Daily Report":
+    st.header("📄 Daily Focus Report")
+    if not st.session_state.history: st.info("Record at least one session to generate a report.")
     else:
+        q=pd.DataFrame(st.session_state.history); avg=q.focus_score.mean(); total=q.duration.sum(); dis=q.distractions.mean(); sl=q.sleep.mean(); c1,c2,c3,c4=st.columns(4); c1.metric("Focus Score",f"{avg:.0f}/100"); c2.metric("Study Time",f"{total:.0f} min"); c3.metric("Distractions",f"{dis:.1f}"); c4.metric("Sleep",f"{sl:.1f} hrs"); st.write(f"You studied **{total:.0f} minutes** across **{len(q)} session(s)** with an average focus score of **{avg:.0f}/100**."); st.warning("📵 Average distractions are high.") if dis>=5 else st.success("✅ Average distractions are manageable."); st.warning("😴 Average sleep is low.") if sl<6 else st.success("😴 Recorded sleep is reasonable."); latest=q.iloc[-1]; st.info(f"🎯 Latest session: **{latest.focus_score}/100 ({level(latest.focus_level)})**"); st.subheader("💡 Next Session Recommendation"); [st.write(x) for x in recs(int(latest.focus_level),int(latest.distractions),float(latest.sleep),float(latest.duration),int(latest.hour))]
 
-        result.append(
-            "🟢 Your focus pattern is strong. "
-            "Continue your current routine."
-        )
+elif menu=="📥 Download Data":
+    st.header("📥 Download Data")
+    if st.session_state.history:
+        st.download_button("⬇️ Download My Study History CSV",pd.DataFrame(st.session_state.history).to_csv(index=False),"my_study_history.csv","text/csv")
+    st.download_button("⬇️ Download Training Dataset",data.to_csv(index=False),"student_focus_training_data.csv","text/csv")
 
-    if distractions >= 5:
-
-        result.append(
-            "📵 Distractions are high. "
-            "Try keeping your phone away while studying."
-        )
-
-    elif distractions >= 3:
-
-        result.append(
-            "📱 Try reducing notifications and unnecessary "
-            "screen activity."
-        )
-
-    if sleep < 6:
-
-        result.append(
-            "😴 Your recorded sleep duration is low. "
-            "A consistent sleep schedule may help your study routine."
-        )
-
-    if duration > 100:
-
-        result.append(
-            "⏱️ This is a long study session. "
-            "Consider taking a short break."
-        )
-
-    if 17 <= hour <= 21:
-
-        result.append(
-            "⭐ This study time falls within the stronger "
-            "study period identified in the sample data."
-        )
-
-    return result
-
-
-# ============================================================
-# CHAT INTERFACE
-# ============================================================
-
-if "messages" not in st.session_state:
-
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": (
-                "👋 **Hello! I'm your Student Focus AI Assistant.**\n\n"
-                "Tell me about your study session and I'll analyze "
-                "your focus pattern.\n\n"
-                "Example:\n\n"
-                "💬 *I studied Python for 60 minutes at 7 pm "
-                "with 2 distractions and slept 7 hours.*"
-            )
-        }
-    ]
-
-
-for message in st.session_state.messages:
-
-    with st.chat_message(
-        message["role"]
-    ):
-
-        st.markdown(
-            message["content"]
-        )
-
-
-user_message = st.chat_input(
-    "Tell me about your study session..."
-)
-
-
-if user_message:
-
-    st.session_state.messages.append(
-        {
-            "role": "user",
-            "content": user_message
-        }
-    )
-
-    with st.chat_message("user"):
-        st.markdown(user_message)
-
-    response = generate_response(
-        user_message
-    )
-
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": response
-        }
-    )
-
-    with st.chat_message("assistant"):
-        st.markdown(response)
-
-
-# ============================================================
-# SIDEBAR INFORMATION
-# ============================================================
-
-with st.sidebar:
-
-    st.title("🎓 Student Focus AI")
-
-    st.markdown("---")
-
-    st.subheader("🤖 AI Model")
-
-    st.write(
-        "Random Forest Classifier"
-    )
-
-    st.write(
-        f"Training Samples: {len(X_train)}"
-    )
-
-    st.write(
-        f"Testing Samples: {len(X_test)}"
-    )
-
-    st.write(
-        f"Test Accuracy: {accuracy * 100:.2f}%"
-    )
-
-    st.markdown("---")
-
-    st.subheader("💬 Example Questions")
-
-    st.write(
-        "• How focused am I?"
-    )
-
-    st.write(
-        "• When should I study?"
-    )
-
-    st.write(
-        "• I get distracted a lot"
-    )
-
-    st.write(
-        "• Which subject needs attention?"
-    )
-
-    st.write(
-        "• I studied Python for 90 minutes"
-    )
-
-    st.markdown("---")
-
-    if st.button("🗑️ Clear Chat"):
-
-        st.session_state.messages = []
-
-        st.rerun()
-
-st.caption(
-    "AI-Based Student Focus Pattern Analyzer | "
-    "Python + Machine Learning + Streamlit"
-)
+st.markdown("---"); st.caption("Student Focus AI Chatbot | Python + Random Forest + Streamlit | Study Pattern Analysis & Personalized Recommendations")
