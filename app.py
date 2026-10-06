@@ -1,168 +1,4636 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import re
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
 
-st.set_page_config(page_title="Student Focus AI Chatbot", page_icon="🎓", layout="wide")
+from flask import Flask, request, jsonify, render_template_string
+import sqlite3
+import os
+import base64
+import uuid
+from datetime import datetime
+from difflib import SequenceMatcher
 
-@st.cache_data
-def make_data():
-    np.random.seed(42)
-    subjects=["Python","Artificial Intelligence","Machine Learning","DBMS","Mathematics","Data Structures"]
-    rows=[]
-    for i in range(1000):
-        subject=np.random.choice(subjects); duration=np.random.randint(20,121); br=np.random.randint(5,31)
-        hour=np.random.randint(6,24); dis=np.random.randint(0,11); sleep=round(np.random.uniform(4.5,9),1); prev=np.random.randint(40,101)
-        s=min(duration/30,4)+sleep*.35+prev*.025-dis*.35+(1.5 if 17<=hour<=21 else 0)-(0.8 if duration>100 else 0)+np.random.normal(0,1)
-        focus=int(np.clip(round(s/2),1,5)); rows.append([i+1,subject,duration,br,hour,dis,sleep,prev,focus])
-    return pd.DataFrame(rows,columns=["student_id","subject","study_duration","break_duration","study_hour","distractions","sleep_hours","previous_score","focus_level"])
+app = Flask(__name__)
 
-data=make_data()
-FEATURES=["study_duration","break_duration","study_hour","distractions","sleep_hours","previous_score"]
-X=data[FEATURES]; y=data.focus_level
-Xtr,Xte,ytr,yte=train_test_split(X,y,test_size=.2,random_state=42)
-@st.cache_resource
-def get_model(a,b):
-    m=RandomForestClassifier(n_estimators=150,random_state=42); m.fit(a,b); return m
-model=get_model(Xtr,ytr); accuracy=accuracy_score(yte,model.predict(Xte))
+DATABASE = "lost_found.db"
+UPLOAD_FOLDER = os.path.join("static", "uploads")
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
 
-if "chat" not in st.session_state: st.session_state.chat=[]
-if "history" not in st.session_state: st.session_state.history=[]
 
-def level(n): return {1:"Very Low",2:"Low",3:"Moderate",4:"High",5:"Very High"}.get(int(n),"Unknown")
-def score(n): return int(round(int(n)*20))
-def best_time(df):
-    h=int(df.groupby("study_hour").focus_level.mean().idxmax()); return f"{h if 1<=h<=12 else (h-12 if h>12 else 12)}:00 {'AM' if h<12 else 'PM'}"
-def recs(f,d,s,t,h):
-    r=[]
-    r.append("🔴 Focus is low. Try 25–30 minute focused sessions." if f<=2 else "🟡 Focus is moderate. Try 40–50 minute sessions." if f==3 else "🟢 Focus is strong. Continue your current routine.")
-    r.append("📵 Distractions are high. Keep your phone away." if d>=5 else "📱 Reduce notifications and unnecessary screen activity." if d>=3 else "✅ Distraction level is under control.")
-    r.append("😴 Sleep is low. Aim for a consistent sleep routine." if s<6 else "🌙 Try to increase sleep toward 7–8 hours." if s<7 else "😴 Sleep duration is in a good range.")
-    if t>100:r.append("⏱️ Session is long. Take a short break before continuing.")
-    if 17<=h<=21:r.append("⭐ This is within the stronger study period found in the training data.")
-    return r
+# =========================================================
+# DATABASE
+# =========================================================
 
-def parse(text):
-    x=text.lower()
-    def num(patterns,default=None,typ=float):
-        for p in patterns:
-            m=re.search(p,x,re.I)
-            if m:
-                try:return typ(m.group(1))
-                except:pass
-        return default
-    duration=num([r"(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)\s*(?:of\s*)?(?:study|studied|studying)?",r"(?:study|studied|studying)\s*(?:for\s*)?(\d+(?:\.\d+)?)\s*(?:minutes?|mins?|min)"],None)
-    h=None
-    m=re.search(r"(?:at|around)\s*(\d{1,2})(?::\d{2})?\s*(am|pm)?",x)
-    if m:
-        h=int(m.group(1)); ap=m.group(2)
-        if ap=="pm" and h<12:h+=12
-        if ap=="am" and h==12:h=0
-    dis=num([r"(\d+)\s*distractions?"],None,int)
-    sleep=num([r"(?:slept|sleep|sleeping)\s*(?:for\s*)?(\d+(?:\.\d+)?)\s*(?:hours?|hrs?|h)"],None)
-    prev=num([r"(?:previous|last|score|mark|marks)\s*(?:score|mark|marks)?\s*(?:was|is|of)?\s*(\d+(?:\.\d+)?)\s*(?:%|percent)?"],75)
-    subs=["python","artificial intelligence","machine learning","dbms","mathematics","data structures"]
-    subject=next((s.title() for s in subs if s in x),"General Study")
-    if duration is not None and h is not None and dis is not None and sleep is not None:
-        return dict(duration=float(duration),break_duration=10.,hour=max(0,min(23,h)),distractions=int(dis),sleep=float(sleep),previous_score=max(0,min(100,float(prev))),subject=subject)
+def get_db():
+    db = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+    return db
 
-def analyze(s,save=True):
-    inp=pd.DataFrame([[s["duration"],s["break_duration"],s["hour"],s["distractions"],s["sleep"],s["previous_score"]]],columns=FEATURES)
-    p=int(model.predict(inp)[0]); conf=float(model.predict_proba(inp).max()*100); s=dict(s,focus_level=p,focus_score=score(p),confidence=conf)
-    if save: st.session_state.history.append(s)
-    return s
 
-def bot(text):
-    p=parse(text)
-    if p:
-        r=analyze(p)
-        out=f"### 🎯 Study Session Analysis\n\n**Subject:** {r['subject']}  \n**Focus Score:** **{r['focus_score']}/100**  \n**Focus Level:** **{level(r['focus_level'])}**  \n**Model Confidence:** **{r['confidence']:.1f}%**\n\n### 💡 Recommendations\n"
-        return out+"\n".join("- "+x for x in recs(r['focus_level'],r['distractions'],r['sleep'],r['duration'],r['hour']))+"\n\n📌 Session added to Study History."
-    x=text.lower()
-    if any(w in x for w in ["hello","hi","hey"]): return "👋 Hello! I'm your Student Focus AI Assistant. Tell me about your study session or ask about study time, distractions, subjects, or planning."
-    if "best study" in x or "productive" in x or "study time" in x:return f"⭐ A strong study period in the training data is around **{best_time(data)}**."
-    if "distract" in x or "phone" in x:return "📵 Keep your phone away, disable unnecessary notifications, use 25–50 minute focus blocks, and take planned breaks."
-    if "subject" in x or "priority" in x:
-        q=priority(data).iloc[0]; return f"📚 Current priority suggestion: **{q.subject}**\n\nAverage score: **{q.avg_score:.1f}%**  \nAverage focus: **{q.avg_focus:.1f}/5**"
-    if "help" in x or "what can" in x:return "🤖 I can predict focus, give recommendations, find a study time, analyze distractions, prioritize subjects, create study plans, track history, and generate a daily report."
-    return "💬 Try: **I studied Python for 60 minutes at 7 pm with 2 distractions and slept 7 hours.**"
+def create_database():
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-def priority(df):
-    q=df.groupby("subject").agg(avg_score=("previous_score","mean"),avg_focus=("focus_level","mean"),study_time=("study_duration","mean")).reset_index()
-    q["priority_score"]=(100-q.avg_score)*.55+(5-q.avg_focus)*10
-    return q.sort_values("priority_score",ascending=False)
+    db = get_db()
 
-st.sidebar.title("🎓 Student Focus AI")
-menu=st.sidebar.radio("Navigate",["🤖 AI Chatbot","🔮 Focus Prediction","📈 Study Analytics","📚 Subject Priority","📅 Study Planner","📋 Study History","📄 Daily Report","📥 Download Data"])
-st.sidebar.markdown("---")
-st.sidebar.write("**Algorithm:** Random Forest Classifier")
-st.sidebar.write(f"**Training Samples:** {len(Xtr)}")
-st.sidebar.write(f"**Testing Samples:** {len(Xte)}")
-st.sidebar.write(f"**Test Accuracy:** {accuracy*100:.2f}%")
-if st.sidebar.button("🗑️ Clear Study History"): st.session_state.history=[]; st.rerun()
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_type TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            colour TEXT,
+            location TEXT NOT NULL,
+            item_date TEXT NOT NULL,
+            description TEXT,
+            contact TEXT,
+            status TEXT DEFAULT 'Active',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            image_path TEXT,
+            reporter_name TEXT,
+            item_condition TEXT,
+            identifying_features TEXT,
+            claimed_by TEXT,
+            resolved_at TEXT
+        )
+    """)
 
-if menu=="🤖 AI Chatbot":
-    st.title("🎓 Student Focus AI Chatbot"); st.caption("AI-powered study pattern analysis and personalized recommendations")
-    if not st.session_state.chat: st.info("👋 Hello! Example: **I studied Python for 60 minutes at 7 pm with 2 distractions and slept 7 hours.**")
-    for role,msg in st.session_state.chat:
-        with st.chat_message(role):st.markdown(msg)
-    prompt=st.chat_input("Tell me about your study session...")
-    if prompt:
-        st.session_state.chat.append(("user",prompt)); st.session_state.chat.append(("assistant",bot(prompt))); st.rerun()
+    columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(items)").fetchall()
+    }
 
-elif menu=="🔮 Focus Prediction":
-    st.header("🔮 AI Focus Prediction")
-    a,b=st.columns(2)
-    with a: dur=st.number_input("Study Duration (minutes)",5,300,60); br=st.number_input("Break Duration (minutes)",0,120,10); hr=st.slider("Study Hour",0,23,19)
-    with b: dis=st.slider("Expected Distractions",0,20,2); sl=st.slider("Sleep Hours",1.,12.,7.,.5); ps=st.slider("Previous Score",0,100,75)
-    if st.button("🔮 Predict Focus",type="primary"):
-        r=analyze(dict(duration=float(dur),break_duration=float(br),hour=int(hr),distractions=int(dis),sleep=float(sl),previous_score=float(ps),subject="Manual Prediction"),save=False)
-        c1,c2,c3=st.columns(3); c1.metric("Focus Score",f"{r['focus_score']}/100"); c2.metric("Focus Level",level(r['focus_level'])); c3.metric("Confidence",f"{r['confidence']:.1f}%"); st.progress(r['focus_score']/100)
-        st.subheader("💡 Recommendations"); [st.write(x) for x in recs(r['focus_level'],dis,sl,dur,hr)]
+    extra = {
+        "image_path": "TEXT",
+        "reporter_name": "TEXT",
+        "item_condition": "TEXT",
+        "identifying_features": "TEXT",
+        "claimed_by": "TEXT",
+        "resolved_at": "TEXT"
+    }
 
-elif menu=="📈 Study Analytics":
-    st.header("📈 Study & Focus Analytics")
-    c1,c2,c3,c4=st.columns(4); c1.metric("Average Focus",f"{data.focus_level.mean():.2f}/5"); c2.metric("Average Study Time",f"{data.study_duration.mean():.1f} min"); c3.metric("Average Distractions",f"{data.distractions.mean():.1f}"); c4.metric("Average Sleep",f"{data.sleep_hours.mean():.1f} hrs")
-    q=data.focus_level.value_counts().sort_index().reset_index(); q.columns=["Focus Level","Count"]; st.plotly_chart(px.bar(q,x="Focus Level",y="Count",title="Focus Level Distribution"),use_container_width=True)
-    c1,c2=st.columns(2)
-    with c1:
-        h=data.groupby("study_hour").focus_level.mean().reset_index(); st.plotly_chart(px.line(h,x="study_hour",y="focus_level",markers=True,title="Average Focus by Study Time"),use_container_width=True)
-    with c2: st.plotly_chart(px.scatter(data,x="distractions",y="focus_level",color="subject",title="Distractions vs Focus"),use_container_width=True)
-    st.plotly_chart(px.scatter(data,x="sleep_hours",y="focus_level",color="subject",title="Sleep Duration vs Focus"),use_container_width=True)
-    st.success(f"⭐ Best study time from training data: **{best_time(data)}**")
+    for name, definition in extra.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE items ADD COLUMN {name} {definition}"
+            )
 
-elif menu=="📚 Subject Priority":
-    st.header("📚 Subject Priority Analysis"); q=priority(data); st.dataframe(q.rename(columns={"subject":"Subject","avg_score":"Average Score","avg_focus":"Average Focus","study_time":"Average Study Time","priority_score":"Priority Score"}),use_container_width=True); st.plotly_chart(px.bar(q,x="subject",y="priority_score",title="Subject Priority"),use_container_width=True)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            message TEXT NOT NULL,
+            notification_type TEXT DEFAULT 'Match',
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
-elif menu=="📅 Study Planner":
-    st.header("📅 Personalized Study Plan"); hours=st.slider("Available Study Time (hours)",1.,8.,3.,.5); text=st.text_input("Subjects","Python, Mathematics"); subs=[x.strip() for x in text.split(",") if x.strip()]
-    if st.button("✨ Generate Study Plan",type="primary"):
-        total=int(hours*60); rows=[]
-        for i,s in enumerate(subs): rows.append({"Order":i+1,"Subject":s,"Focus Time":f"{max(20,total//len(subs))} min","Break":"10 min" if i<len(subs)-1 else "Final review"})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True); st.success("🎯 Put your most difficult subject in your strongest study period.")
+    db.commit()
+    db.close()
 
-elif menu=="📋 Study History":
-    st.header("📋 Your Study History")
-    if not st.session_state.history: st.info("No sessions yet. Use the chatbot with a complete study-session message.")
-    else:
-        q=pd.DataFrame(st.session_state.history); q["Focus"]=q.focus_level.apply(level); st.dataframe(q[["subject","duration","hour","distractions","sleep","previous_score","focus_score","Focus"]],use_container_width=True); st.plotly_chart(px.line(q.reset_index(),x="index",y="focus_score",markers=True,title="Focus Score Progress"),use_container_width=True)
-        if len(q)>=2:
-            d=q.focus_score.iloc[-1]-q.focus_score.iloc[0]; st.success(f"📈 Focus improved by {d} points.") if d>0 else st.warning(f"📉 Focus is {abs(d)} points lower than the first session.") if d<0 else st.info("➡️ Focus is unchanged from the first session.")
 
-elif menu=="📄 Daily Report":
-    st.header("📄 Daily Focus Report")
-    if not st.session_state.history: st.info("Record at least one session to generate a report.")
-    else:
-        q=pd.DataFrame(st.session_state.history); avg=q.focus_score.mean(); total=q.duration.sum(); dis=q.distractions.mean(); sl=q.sleep.mean(); c1,c2,c3,c4=st.columns(4); c1.metric("Focus Score",f"{avg:.0f}/100"); c2.metric("Study Time",f"{total:.0f} min"); c3.metric("Distractions",f"{dis:.1f}"); c4.metric("Sleep",f"{sl:.1f} hrs"); st.write(f"You studied **{total:.0f} minutes** across **{len(q)} session(s)** with an average focus score of **{avg:.0f}/100**."); st.warning("📵 Average distractions are high.") if dis>=5 else st.success("✅ Average distractions are manageable."); st.warning("😴 Average sleep is low.") if sl<6 else st.success("😴 Recorded sleep is reasonable."); latest=q.iloc[-1]; st.info(f"🎯 Latest session: **{latest.focus_score}/100 ({level(latest.focus_level)})**"); st.subheader("💡 Next Session Recommendation"); [st.write(x) for x in recs(int(latest.focus_level),int(latest.distractions),float(latest.sleep),float(latest.duration),int(latest.hour))]
+create_database()
 
-elif menu=="📥 Download Data":
-    st.header("📥 Download Data")
-    if st.session_state.history:
-        st.download_button("⬇️ Download My Study History CSV",pd.DataFrame(st.session_state.history).to_csv(index=False),"my_study_history.csv","text/csv")
-    st.download_button("⬇️ Download Training Dataset",data.to_csv(index=False),"student_focus_training_data.csv","text/csv")
 
-st.markdown("---"); st.caption("Student Focus AI Chatbot | Python + Random Forest + Streamlit | Study Pattern Analysis & Personalized Recommendations")
+# =========================================================
+# HELPERS
+# =========================================================
+
+def normal(value):
+    return str(value or "").strip().lower()
+
+
+def similarity(a, b):
+    a = normal(a)
+    b = normal(b)
+
+    if not a or not b:
+        return 0
+
+    if a == b:
+        return 1
+
+    ratio = SequenceMatcher(None, a, b).ratio()
+
+    wa = set(a.split())
+    wb = set(b.split())
+    common = wa.intersection(wb)
+
+    word_score = (
+        len(common) / max(len(wa), len(wb))
+        if wa and wb else 0
+    )
+
+    if a in b or b in a:
+        ratio = max(ratio, 0.90)
+
+    return max(ratio, word_score)
+
+
+def date_similarity(a, b):
+    if not a or not b:
+        return 0
+
+    if a == b:
+        return 1
+
+    try:
+        d1 = datetime.strptime(a, "%Y-%m-%d")
+        d2 = datetime.strptime(b, "%Y-%m-%d")
+        days = abs((d1 - d2).days)
+
+        if days == 1:
+            return 0.70
+        if days <= 3:
+            return 0.40
+    except ValueError:
+        pass
+
+    return 0
+
+
+def save_image(data_url):
+    if not data_url:
+        return ""
+
+    if not data_url.startswith("data:image/"):
+        raise ValueError("Invalid image.")
+
+    try:
+        header, encoded = data_url.split(",", 1)
+        raw = base64.b64decode(encoded)
+
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError("Image must be 2 MB or smaller.")
+
+        if "image/png" in header:
+            ext = ".png"
+        elif "image/jpeg" in header or "image/jpg" in header:
+            ext = ".jpg"
+        elif "image/webp" in header:
+            ext = ".webp"
+        else:
+            raise ValueError("Only PNG, JPG and WEBP are supported.")
+
+        filename = uuid.uuid4().hex + ext
+        path = os.path.join(UPLOAD_FOLDER, filename)
+
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        return "/static/uploads/" + filename
+
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("Could not process image.")
+
+
+def delete_image(path):
+    if not path or not path.startswith("/static/uploads/"):
+        return
+
+    local = path.lstrip("/").replace("/", os.sep)
+
+    if os.path.exists(local):
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+
+
+# =========================================================
+# SMART MATCHING
+# =========================================================
+
+def find_matches(new_item):
+    db = get_db()
+
+    opposite = (
+        "Found Item"
+        if new_item["record_type"] == "Lost Item"
+        else "Lost Item"
+    )
+
+    rows = db.execute("""
+        SELECT * FROM items
+        WHERE record_type = ?
+          AND status = 'Active'
+          AND id != ?
+    """, (opposite, new_item.get("id", -1))).fetchall()
+
+    matches = []
+
+    for row in rows:
+        score = 0
+
+        # Name 30%
+        score += round(
+            similarity(new_item.get("item_name"), row["item_name"]) * 30
+        )
+
+        # Category 20%
+        if normal(new_item.get("category")) == normal(row["category"]):
+            score += 20
+
+        # Colour 15%
+        c1 = normal(new_item.get("colour"))
+        c2 = normal(row["colour"])
+
+        if c1 and c2:
+            if c1 == c2:
+                score += 15
+            elif similarity(c1, c2) >= 0.70:
+                score += 8
+
+        # Location 20%
+        l1 = normal(new_item.get("location"))
+        l2 = normal(row["location"])
+
+        if l1 == l2:
+            score += 20
+        elif similarity(l1, l2) >= 0.75:
+            score += 10
+
+        # Date 15%
+        score += round(
+            date_similarity(
+                new_item.get("item_date"),
+                row["item_date"]
+            ) * 15
+        )
+
+        if score >= 40:
+            matches.append({
+                "id": row["id"],
+                "item_name": row["item_name"],
+                "record_type": row["record_type"],
+                "category": row["category"],
+                "colour": row["colour"],
+                "location": row["location"],
+                "item_date": row["item_date"],
+                "image_path": row["image_path"],
+                "score": min(score, 100)
+            })
+
+    db.close()
+
+    matches.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return matches[:10]
+
+
+def create_notifications(item, matches):
+    if not matches:
+        return
+
+    best = matches[0]
+    db = get_db()
+
+    db.execute("""
+        INSERT INTO notifications
+        (item_id, message, notification_type)
+        VALUES (?, ?, 'Match')
+    """, (
+        item["id"],
+        f"Possible match for '{item['item_name']}' "
+        f"with '{best['item_name']}' — {best['score']}% match."
+    ))
+
+    db.execute("""
+        INSERT INTO notifications
+        (item_id, message, notification_type)
+        VALUES (?, ?, 'Match')
+    """, (
+        best["id"],
+        f"A possible match was found for "
+        f"'{best['item_name']}' — {best['score']}% match."
+    ))
+
+    db.commit()
+    db.close()
+
+
+# =========================================================
+# PAGE
+# =========================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+# =========================================================
+# ITEMS
+# =========================================================
+
+@app.route("/api/items", methods=["GET"])
+def get_items():
+    db = get_db()
+
+    rows = db.execute("""
+        SELECT * FROM items
+        ORDER BY id DESC
+    """).fetchall()
+
+    db.close()
+
+    return jsonify([dict(row) for row in rows])
+
+
+@app.route("/api/items", methods=["POST"])
+def create_item():
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "No data received"
+        }), 400
+
+    required = [
+        "record_type",
+        "item_name",
+        "category",
+        "location",
+        "item_date"
+    ]
+
+    for field in required:
+        if not str(data.get(field, "")).strip():
+            return jsonify({
+                "success": False,
+                "message": f"{field} is required"
+            }), 400
+
+    try:
+        image_path = save_image(data.get("image_data", ""))
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 400
+
+    db = get_db()
+
+    cursor = db.execute("""
+        INSERT INTO items (
+            record_type, item_name, category, colour,
+            location, item_date, description, contact,
+            status, image_path, reporter_name,
+            item_condition, identifying_features
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?, ?)
+    """, (
+        data["record_type"],
+        data["item_name"].strip(),
+        data["category"],
+        data.get("colour", "").strip(),
+        data["location"],
+        data["item_date"],
+        data.get("description", "").strip(),
+        data.get("contact", "").strip(),
+        image_path,
+        data.get("reporter_name", "").strip(),
+        data.get("item_condition", ""),
+        data.get("identifying_features", "").strip()
+    ))
+
+    item_id = cursor.lastrowid
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    item = dict(row)
+    matches = find_matches(item)
+    create_notifications(item, matches)
+
+    return jsonify({
+        "success": True,
+        "message": "Item saved successfully",
+        "item": item,
+        "matches": matches
+    })
+
+
+@app.route("/api/items/<int:item_id>", methods=["GET"])
+def get_item(item_id):
+    db = get_db()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify(dict(row))
+
+
+@app.route("/api/items/<int:item_id>", methods=["PUT"])
+def update_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    old = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    if not old:
+        db.close()
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    old_image = old["image_path"] or ""
+    image_path = old_image
+
+    try:
+        if data.get("image_data"):
+            image_path = save_image(data["image_data"])
+    except ValueError as e:
+        db.close()
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 400
+
+    db.execute("""
+        UPDATE items SET
+            record_type=?,
+            item_name=?,
+            category=?,
+            colour=?,
+            location=?,
+            item_date=?,
+            description=?,
+            contact=?,
+            image_path=?,
+            reporter_name=?,
+            item_condition=?,
+            identifying_features=?
+        WHERE id=?
+    """, (
+        data.get("record_type", ""),
+        data.get("item_name", "").strip(),
+        data.get("category", ""),
+        data.get("colour", "").strip(),
+        data.get("location", ""),
+        data.get("item_date", ""),
+        data.get("description", "").strip(),
+        data.get("contact", "").strip(),
+        image_path,
+        data.get("reporter_name", "").strip(),
+        data.get("item_condition", ""),
+        data.get("identifying_features", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if image_path != old_image:
+        delete_image(old_image)
+
+    return jsonify({
+        "success": True,
+        "message": "Item updated successfully",
+        "item": dict(row)
+    })
+
+
+@app.route("/api/items/<int:item_id>", methods=["DELETE"])
+def delete_item(item_id):
+    db = get_db()
+
+    old = db.execute(
+        "SELECT image_path FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    cursor = db.execute(
+        "DELETE FROM items WHERE id=?",
+        (item_id,)
+    )
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    if old:
+        delete_image(old["image_path"])
+
+    return jsonify({
+        "success": True,
+        "message": "Item deleted successfully"
+    })
+
+
+# =========================================================
+# RESOLVE / CLAIM
+# =========================================================
+
+@app.route("/api/items/<int:item_id>/resolve", methods=["PUT"])
+def resolve_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    cursor = db.execute("""
+        UPDATE items
+        SET status='Resolved',
+            claimed_by=?,
+            resolved_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (
+        data.get("claimed_by", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "message": "Item marked as resolved"
+    })
+
+
+@app.route("/api/items/<int:item_id>/claim", methods=["PUT"])
+def claim_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    cursor = db.execute("""
+        UPDATE items
+        SET status='Claimed',
+            claimed_by=?,
+            resolved_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (
+        data.get("claimed_by", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "message": "Item marked as claimed"
+    })
+
+
+# =========================================================
+# MATCHES
+# =========================================================
+
+@app.route("/api/matches/<int:item_id>")
+def matches(item_id):
+    db = get_db()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if not row:
+        return jsonify([])
+
+    return jsonify(find_matches(dict(row)))
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
+
+@app.route("/api/notifications")
+def notifications():
+    db = get_db()
+
+    rows = db.execute("""
+        SELECT *
+        FROM notifications
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
+
+    unread = db.execute("""
+        SELECT COUNT(*) AS n
+        FROM notifications
+        WHERE is_read=0
+    """).fetchone()["n"]
+
+    db.close()
+
+    return jsonify({
+        "notifications": [dict(x) for x in rows],
+        "unread": unread
+    })
+
+
+@app.route("/api/notifications/read", methods=["PUT"])
+def notifications_read():
+    db = get_db()
+
+    db.execute(
+        "UPDATE notifications SET is_read=1 WHERE is_read=0"
+    )
+
+    db.commit()
+    db.close()
+
+    return jsonify({"success": True})
+
+
+# =========================================================
+# ANALYTICS
+# =========================================================
+
+@app.route("/api/analytics")
+def analytics():
+    db = get_db()
+
+    total = db.execute(
+        "SELECT COUNT(*) n FROM items"
+    ).fetchone()["n"]
+
+    lost = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE record_type='Lost Item'"
+    ).fetchone()["n"]
+
+    found = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE record_type='Found Item'"
+    ).fetchone()["n"]
+
+    active = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Active'"
+    ).fetchone()["n"]
+
+    resolved = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Resolved'"
+    ).fetchone()["n"]
+
+    claimed = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Claimed'"
+    ).fetchone()["n"]
+
+    match_notifications = db.execute("""
+        SELECT COUNT(*) n
+        FROM notifications
+        WHERE notification_type='Match'
+    """).fetchone()["n"]
+
+    categories = db.execute("""
+        SELECT category, COUNT(*) count
+        FROM items
+        GROUP BY category
+        ORDER BY count DESC
+    """).fetchall()
+
+    locations = db.execute("""
+        SELECT location, COUNT(*) count
+        FROM items
+        GROUP BY location
+        ORDER BY count DESC
+        LIMIT 8
+    """).fetchall()
+
+    db.close()
+
+    return jsonify({
+        "total": total,
+        "lost": lost,
+        "found": found,
+        "active": active,
+        "resolved": resolved,
+        "claimed": claimed,
+        "match_rate": round(
+            (match_notifications / total) * 100, 1
+        ) if total else 0,
+        "categories": [dict(x) for x in categories],
+        "locations": [dict(x) for x in locations]
+    })
+
+
+# =========================================================
+# FRONTEND
+# =========================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FINDLY | Smart Lost & Found</title>
+
+<style>
+:root {
+    --bg:#f4f7fb;
+    --card:#fff;
+    --text:#172033;
+    --muted:#718096;
+    --border:#e2e8f0;
+    --soft:#f7f9fc;
+    --primary:#2f6fed;
+}
+
+* { box-sizing:border-box; }
+
+body {
+    margin:0;
+    font-family:Arial,Helvetica,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+}
+
+body.dark {
+    --bg:#111827;
+    --card:#1f2937;
+    --text:#f3f4f6;
+    --muted:#aab4c5;
+    --border:#374151;
+    --soft:#273449;
+}
+
+header {
+    background:var(--card);
+    border-bottom:1px solid var(--border);
+    padding:16px 6%;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    position:sticky;
+    top:0;
+    z-index:50;
+}
+
+.logo {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    font-size:23px;
+    font-weight:800;
+    color:var(--primary);
+}
+
+.logo-icon {
+    width:38px;
+    height:38px;
+    border-radius:10px;
+    background:var(--primary);
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+}
+
+.header-actions {
+    display:flex;
+    gap:8px;
+}
+
+button {
+    border:0;
+    border-radius:8px;
+    padding:10px 14px;
+    cursor:pointer;
+    font-weight:600;
+}
+
+.icon-btn,.secondary {
+    background:var(--soft);
+    color:var(--text);
+    border:1px solid var(--border);
+}
+
+.primary {
+    background:var(--primary);
+    color:#fff;
+}
+
+.danger {
+    background:#fff0f0;
+    color:#c53030;
+}
+
+.resolve {
+    background:#edf8f1;
+    color:#287d48;
+}
+
+.claim {
+    background:#f0eaff;
+    color:#6941c6;
+}
+
+.container {
+    width:88%;
+    max-width:1300px;
+    margin:30px auto;
+}
+
+.hero h1 {
+    margin:0;
+    font-size:34px;
+}
+
+.hero p {
+    color:var(--muted);
+}
+
+.stats {
+    display:grid;
+    grid-template-columns:repeat(6,1fr);
+    gap:12px;
+    margin:24px 0;
+}
+
+.stat,.card {
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:14px;
+}
+
+.stat {
+    padding:17px;
+}
+
+.stat-title {
+    color:var(--muted);
+    font-size:11px;
+    text-transform:uppercase;
+}
+
+.stat-value {
+    font-size:25px;
+    font-weight:700;
+    margin-top:7px;
+}
+
+.card {
+    padding:25px;
+    margin-bottom:22px;
+}
+
+.subtitle {
+    color:var(--muted);
+    font-size:14px;
+    margin-bottom:20px;
+}
+
+.form-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:17px;
+}
+
+.field {
+    display:flex;
+    flex-direction:column;
+}
+
+.full {
+    grid-column:1/-1;
+}
+
+label {
+    font-size:13px;
+    font-weight:600;
+    margin-bottom:7px;
+}
+
+input,select,textarea {
+    width:100%;
+    padding:12px 13px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--card);
+    color:var(--text);
+    outline:none;
+}
+
+textarea {
+    min-height:85px;
+    resize:vertical;
+}
+
+input:focus,select:focus,textarea:focus {
+    border-color:var(--primary);
+}
+
+.form-actions,.actions {
+    display:flex;
+    gap:7px;
+    flex-wrap:wrap;
+    margin-top:20px;
+}
+
+.actions { margin-top:0; }
+
+.filters {
+    display:grid;
+    grid-template-columns:2fr 1fr 1fr 1fr;
+    gap:10px;
+}
+
+.table-wrapper {
+    overflow-x:auto;
+}
+
+table {
+    width:100%;
+    border-collapse:collapse;
+    min-width:1050px;
+}
+
+th {
+    text-align:left;
+    padding:12px;
+    background:var(--soft);
+    color:var(--muted);
+    font-size:11px;
+    text-transform:uppercase;
+}
+
+td {
+    padding:12px;
+    border-top:1px solid var(--border);
+    font-size:13px;
+}
+
+.badge {
+    display:inline-block;
+    padding:5px 9px;
+    border-radius:20px;
+    font-size:10px;
+    font-weight:700;
+}
+
+.badge-lost {
+    background:#fff4e5;
+    color:#a85d00;
+}
+
+.badge-found {
+    background:#edf8f1;
+    color:#287d48;
+}
+
+.badge-resolved {
+    background:#eef1f5;
+    color:#667085;
+}
+
+.badge-claimed {
+    background:#f0eaff;
+    color:#6941c6;
+}
+
+.thumb {
+    width:48px;
+    height:48px;
+    object-fit:cover;
+    border-radius:7px;
+    border:1px solid var(--border);
+}
+
+.preview {
+    display:none;
+    margin-top:8px;
+    max-width:180px;
+    max-height:130px;
+    border-radius:8px;
+}
+
+.match-box {
+    display:none;
+    margin-top:20px;
+    padding:15px;
+    background:var(--soft);
+    border-left:4px solid var(--primary);
+    border-radius:8px;
+}
+
+.match-item {
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:12px;
+    margin-top:8px;
+}
+
+.match-score {
+    color:var(--primary);
+    font-weight:800;
+}
+
+.analytics-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:20px;
+}
+
+.analytics-list div {
+    display:flex;
+    justify-content:space-between;
+    padding:9px 0;
+    border-bottom:1px solid var(--border);
+}
+
+.notification-panel {
+    position:fixed;
+    right:20px;
+    top:72px;
+    width:min(390px,calc(100vw - 30px));
+    max-height:70vh;
+    overflow:auto;
+    background:var(--card);
+    border:1px solid var(--border);
+    box-shadow:0 15px 40px rgba(0,0,0,.18);
+    border-radius:12px;
+    z-index:100;
+    display:none;
+    padding:16px;
+}
+
+.notification {
+    padding:11px 0;
+    border-bottom:1px solid var(--border);
+    font-size:13px;
+}
+
+.notification-btn {
+    position:relative;
+}
+
+.notification-count {
+    position:absolute;
+    right:-5px;
+    top:-6px;
+    background:#e53e3e;
+    color:#fff;
+    min-width:18px;
+    height:18px;
+    border-radius:20px;
+    display:none;
+    align-items:center;
+    justify-content:center;
+    font-size:10px;
+}
+
+.empty {
+    text-align:center;
+    padding:40px;
+    color:var(--muted);
+}
+
+.small-note {
+    color:var(--muted);
+    font-size:11px;
+    margin-top:5px;
+}
+
+.toast {
+    position:fixed;
+    right:20px;
+    bottom:20px;
+    background:#172b4d;
+    color:#fff;
+    padding:12px 17px;
+    border-radius:8px;
+    display:none;
+    z-index:999;
+}
+
+@media(max-width:1050px) {
+    .stats { grid-template-columns:repeat(3,1fr); }
+    .filters { grid-template-columns:1fr 1fr; }
+}
+
+@media(max-width:750px) {
+    .container { width:94%; }
+    .stats { grid-template-columns:1fr 1fr; }
+    .form-grid { grid-template-columns:1fr; }
+    .full { grid-column:auto; }
+    .filters { grid-template-columns:1fr; }
+    .analytics-grid { grid-template-columns:1fr; }
+    .header-text { display:none; }
+    .hero h1 { font-size:28px; }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <div class="logo">
+        <div class="logo-icon">✓</div>
+        FINDLY
+    </div>
+
+    <div class="header-text">
+        Smart Lost & Found Management System
+    </div>
+
+    <div class="header-actions">
+        <button class="icon-btn notification-btn"
+                onclick="toggleNotifications()">
+            🔔
+            <span id="notificationCount"
+                  class="notification-count">0</span>
+        </button>
+
+        <button class="icon-btn"
+                id="themeButton"
+                onclick="toggleDarkMode()">
+            🌙
+        </button>
+    </div>
+</header>
+
+<div id="notificationPanel" class="notification-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>Notifications</strong>
+        <button class="secondary"
+                onclick="markNotificationsRead()">
+            Mark read
+        </button>
+    </div>
+    <div id="notificationList"></div>
+</div>
+
+<div class="container">
+
+    <div class="hero">
+        <h1>Smart Lost & Found</h1>
+        <p>
+            Report, manage and intelligently identify possible matches.
+        </p>
+    </div>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-title">Total Records</div>
+            <div class="stat-value" id="totalRecords">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Lost Items</div>
+            <div class="stat-value" id="lostItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Found Items</div>
+            <div class="stat-value" id="foundItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Active Items</div>
+            <div class="stat-value" id="activeItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Resolved / Claimed</div>
+            <div class="stat-value" id="resolvedItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Match Rate</div>
+            <div class="stat-value" id="matchRate">0%</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 id="formTitle">Report Lost / Found Item</h2>
+        <div class="subtitle">
+            Add complete details to improve matching accuracy.
+        </div>
+
+        <form id="itemForm">
+
+            <div class="form-grid">
+
+                <div class="field">
+                    <label>Record Type *</label>
+                    <select id="record_type" required>
+                        <option>Lost Item</option>
+                        <option>Found Item</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Item Name *</label>
+                    <input id="item_name"
+                           placeholder="Example: Black Wallet"
+                           required>
+                </div>
+
+                <div class="field">
+                    <label>Category *</label>
+                    <select id="category" required>
+                        <option value="">Select Category</option>
+                        <option>Wallet</option>
+                        <option>Mobile Phone</option>
+                        <option>Laptop</option>
+                        <option>Bag</option>
+                        <option>ID Card</option>
+                        <option>Keys</option>
+                        <option>Book</option>
+                        <option>Earphones</option>
+                        <option>Watch</option>
+                        <option>Water Bottle</option>
+                        <option>Umbrella</option>
+                        <option>Other</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Colour</label>
+                    <input id="colour" placeholder="Example: Black">
+                </div>
+
+                <div class="field">
+                    <label>College Location *</label>
+                    <select id="location" required>
+                        <option value="">Select Location</option>
+                        <option>College Canteen</option>
+                        <option>Library</option>
+                        <option>Computer Lab</option>
+                        <option>Classroom</option>
+                        <option>Seminar Hall</option>
+                        <option>Auditorium</option>
+                        <option>Parking Area</option>
+                        <option>Hostel</option>
+                        <option>Bus / Transport</option>
+                        <option>Sports Ground</option>
+                        <option>Administrative Block</option>
+                        <option>Department Block</option>
+                        <option>Other</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Date *</label>
+                    <input id="item_date" type="date" required>
+                </div>
+
+                <div class="field">
+                    <label>Condition</label>
+                    <select id="item_condition">
+                        <option value="">Select Condition</option>
+                        <option>New</option>
+                        <option>Good</option>
+                        <option>Used</option>
+                        <option>Damaged</option>
+                        <option>Unknown</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Reporter Name</label>
+                    <input id="reporter_name"
+                           placeholder="Your name">
+                </div>
+
+                <div class="field full">
+                    <label>Identifying Features</label>
+                    <input id="identifying_features"
+                           placeholder="Sticker, initials, scratch, cover, unique mark...">
+                </div>
+
+                <div class="field full">
+                    <label>Description</label>
+                    <textarea id="description"
+                              placeholder="Describe the item..."></textarea>
+                </div>
+
+                <div class="field">
+                    <label>Contact</label>
+                    <input id="contact"
+                           placeholder="Phone / Email">
+                </div>
+
+                <div class="field">
+                    <label>Item Photo</label>
+                    <input id="image"
+                           type="file"
+                           accept="image/png,image/jpeg,image/webp"
+                           onchange="previewImage()">
+                    <img id="imagePreview" class="preview">
+                    <div class="small-note">
+                        PNG/JPG/WEBP, maximum 2 MB
+                    </div>
+                </div>
+
+            </div>
+
+            <div class="form-actions">
+                <button class="primary"
+                        type="submit"
+                        id="saveButton">
+                    Save Item
+                </button>
+
+                <button class="secondary"
+                        type="button"
+                        onclick="resetForm()">
+                    Clear
+                </button>
+            </div>
+
+        </form>
+
+        <div class="match-box" id="matchBox">
+            <strong>🎯 Possible Matching Items</strong>
+            <div id="matchResults"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>🔍 Advanced Search & Filters</h2>
+
+        <div class="filters">
+
+            <input id="search"
+                   placeholder="Search item, category, location..."
+                   oninput="displayItems()">
+
+            <select id="filterType" onchange="displayItems()">
+                <option value="">All Types</option>
+                <option>Lost Item</option>
+                <option>Found Item</option>
+            </select>
+
+            <select id="filterCategory" onchange="displayItems()">
+                <option value="">All Categories</option>
+                <option>Wallet</option>
+                <option>Mobile Phone</option>
+                <option>Laptop</option>
+                <option>Bag</option>
+                <option>ID Card</option>
+                <option>Keys</option>
+                <option>Book</option>
+                <option>Earphones</option>
+                <option>Watch</option>
+                <option>Other</option>
+            </select>
+
+            <select id="filterLocation" onchange="displayItems()">
+                <option value="">All Locations</option>
+                <option>College Canteen</option>
+                <option>Library</option>
+                <option>Computer Lab</option>
+                <option>Classroom</option>
+                <option>Seminar Hall</option>
+                <option>Auditorium</option>
+                <option>Parking Area</option>
+                <option>Hostel</option>
+                <option>Bus / Transport</option>
+                <option>Sports Ground</option>
+                <option>Administrative Block</option>
+                <option>Department Block</option>
+                <option>Other</option>
+            </select>
+
+        </div>
+
+        <br>
+
+        <select id="filterStatus"
+                onchange="displayItems()"
+                style="max-width:250px;">
+            <option value="">All Status</option>
+            <option>Active</option>
+            <option>Resolved</option>
+            <option>Claimed</option>
+        </select>
+
+        <button class="secondary"
+                onclick="clearFilters()">
+            Clear Filters
+        </button>
+    </div>
+
+    <div class="card">
+        <h2>📋 Item Records</h2>
+        <div class="subtitle">
+            Manage all reported items.
+        </div>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Photo</th>
+                        <th>ID</th>
+                        <th>Type</th>
+                        <th>Item</th>
+                        <th>Category</th>
+                        <th>Colour</th>
+                        <th>Location</th>
+                        <th>Date</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+
+                <tbody id="itemTable"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>📊 Admin Analytics Dashboard</h2>
+        <div class="subtitle">
+            Quick overview of FINDLY activity.
+        </div>
+
+        <div class="analytics-grid">
+
+            <div>
+                <h3>Top Categories</h3>
+                <div id="categoryAnalytics"
+                     class="analytics-list"></div>
+            </div>
+
+            <div>
+                <h3>Top Locations</h3>
+                <div id="locationAnalytics"
+                     class="analytics-list"></div>
+            </div>
+
+        </div>
+    </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let allItems = [];
+let editingId = null;
+
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+
+function showToast(message) {
+    const toast = document.getElementById("toast");
+    toast.innerText = message;
+    toast.style.display = "block";
+
+    setTimeout(() => {
+        toast.style.display = "none";
+    }, 2800);
+}
+
+
+async function loadItems() {
+    try {
+        const response = await fetch("/api/items");
+
+        if (!response.ok) {
+            throw new Error("Server error");
+        }
+
+        allItems = await response.json();
+
+        displayItems();
+        updateStats();
+        loadAnalytics();
+        loadNotifications();
+
+    } catch (error) {
+        console.error(error);
+        showToast("Unable to load records.");
+    }
+}
+
+
+function displayItems() {
+    const table = document.getElementById("itemTable");
+
+    const search = document
+        .getElementById("search")
+        .value
+        .toLowerCase()
+        .trim();
+
+    const type =
+        document.getElementById("filterType").value;
+
+    const category =
+        document.getElementById("filterCategory").value;
+
+    const location =
+        document.getElementById("filterLocation").value;
+
+    const status =
+        document.getElementById("filterStatus").value;
+
+    const filtered = allItems.filter(item => {
+
+        const text = [
+            item.item_name,
+            item.category,
+            item.location,
+            item.record_type,
+            item.colour,
+            item.description,
+            item.identifying_features,
+            item.reporter_name
+        ].join(" ").toLowerCase();
+
+        return (
+            text.includes(search) &&
+            (!type || item.record_type === type) &&
+            (!category || item.category === category) &&
+            (!location || item.location === location) &&
+            (!status || item.status === status)
+        );
+    });
+
+    if (!filtered.length) {
+        table.innerHTML = `
+            <tr>
+                <td colspan="10" class="empty">
+                    No records found.
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    table.innerHTML = filtered.map(item => {
+
+        let statusClass = "badge-found";
+
+        if (item.status === "Resolved") {
+            statusClass = "badge-resolved";
+        }
+
+        if (item.status === "Claimed") {
+            statusClass = "badge-claimed";
+        }
+
+        const typeClass =
+            item.record_type === "Lost Item"
+            ? "badge-lost"
+            : "badge-found";
+
+        return `
+            <tr>
+
+                <td>
+                    ${
+                        item.image_path
+                        ? `<img class="thumb"
+                                src="${escapeHtml(item.image_path)}">`
+                        : "—"
+                    }
+                </td>
+
+                <td>${item.id}</td>
+
+                <td>
+                    <span class="badge ${typeClass}">
+                        ${escapeHtml(item.record_type)}
+                    </span>
+                </td>
+
+                <td>
+                    <strong>
+                        ${escapeHtml(item.item_name)}
+                    </strong>
+                </td>
+
+                <td>${escapeHtml(item.category)}</td>
+
+                <td>${escapeHtml(item.colour || "-")}</td>
+
+                <td>${escapeHtml(item.location)}</td>
+
+                <td>${escapeHtml(item.item_date)}</td>
+
+                <td>
+                    <span class="badge ${statusClass}">
+                        ${escapeHtml(item.status)}
+                    </span>
+                </td>
+
+                <td>
+                    <div class="actions">
+
+                        <button class="secondary"
+                                onclick="viewItem(${item.id})">
+                            View
+                        </button>
+
+                        <button class="primary"
+                                onclick="editItem(${item.id})">
+                            Edit
+                        </button>
+
+                        ${
+                            item.status === "Active"
+                            ? `
+                            <button class="resolve"
+                                    onclick="resolveItem(${item.id})">
+                                Resolve
+                            </button>
+
+                            <button class="claim"
+                                    onclick="claimItem(${item.id})">
+                                Claim
+                            </button>
+                            `
+                            : ""
+                        }
+
+                        <button class="danger"
+                                onclick="deleteItem(${item.id})">
+                            Delete
+                        </button>
+
+                    </div>
+                </td>
+
+            </tr>
+        `;
+    }).join("");
+}
+
+
+function fileToDataUrl(file) {
+    if (!file) {
+        return Promise.resolve("");
+    }
+
+    if (file.size > 2 * 1024 * 1024) {
+        return Promise.reject(
+            new Error("Image must be 2 MB or smaller.")
+        );
+    }
+
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () =>
+            reject(new Error("Could not read image."));
+
+        reader.readAsDataURL(file);
+    });
+}
+
+
+function previewImage() {
+    const input = document.getElementById("image");
+    const preview = document.getElementById("imagePreview");
+
+    if (!input.files.length) {
+        preview.style.display = "none";
+        return;
+    }
+
+    if (input.files[0].size > 2 * 1024 * 1024) {
+        showToast("Image must be 2 MB or smaller.");
+        input.value = "";
+        preview.style.display = "none";
+        return;
+    }
+
+    preview.src =
+        URL.createObjectURL(input.files[0]);
+
+    preview.style.display = "block";
+}
+
+
+document.getElementById("itemForm")
+.addEventListener("submit", async event => {
+
+    event.preventDefault();
+
+    const button =
+        document.getElementById("saveButton");
+
+    button.disabled = true;
+    button.innerText =
+        editingId ? "Updating..." : "Saving...";
+
+    try {
+
+        const image =
+            document.getElementById("image").files[0];
+
+        const imageData =
+            await fileToDataUrl(image);
+
+        const data = {
+            record_type:
+                document.getElementById("record_type").value,
+
+            item_name:
+                document.getElementById("item_name").value.trim(),
+
+            category:
+                document.getElementById("category").value,
+
+            colour:
+                document.getElementById("colour").value.trim(),
+
+            location:
+                document.getElementById("location").value,
+
+            item_date:
+                document.getElementById("item_date").value,
+
+            item_condition:
+                document.getElementById("item_condition").value,
+
+            reporter_name:
+                document.getElementById("reporter_name").value.trim(),
+
+            identifying_features:
+                document
+                .getElementById("identifying_features")
+                .value.trim(),
+
+            description:
+                document.getElementById("description").value.trim(),
+
+            contact:
+                document.getElementById("contact").value.trim(),
+
+            image_data: imageData
+        };
+
+        let response;
+
+        if (editingId) {
+
+            response = await fetch(
+                `/api/items/${editingId}`,
+                {
+                    method:"PUT",
+                    headers:{
+                        "Content-Type":"application/json"
+                    },
+                    body:JSON.stringify(data)
+                }
+            );
+
+        } else {
+
+            response = await fetch(
+                "/api/items",
+                {
+                    method:"POST",
+                    headers:{
+                        "Content-Type":"application/json"
+                    },
+                    body:JSON.stringify(data)
+                }
+            );
+        }
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                result.message || "Operation failed"
+            );
+        }
+
+        if (editingId) {
+            showToast("Item updated successfully.");
+        } else {
+            showToast("Item saved successfully.");
+
+            if (result.matches &&
+                result.matches.length) {
+                showMatches(result.matches);
+                showToast(
+                    "Item saved — possible match found!"
+                );
+            }
+        }
+
+        editingId = null;
+        resetForm(false);
+        await loadItems();
+
+    } catch (error) {
+        console.error(error);
+        showToast(error.message);
+
+    } finally {
+        button.disabled = false;
+        button.innerText = "Save Item";
+    }
+});
+
+
+function showMatches(matches) {
+    const box =
+        document.getElementById("matchBox");
+
+    const results =
+        document.getElementById("matchResults");
+
+    box.style.display = "block";
+
+    if (!matches.length) {
+        results.innerHTML =
+            "<p>No possible matches found.</p>";
+        return;
+    }
+
+    results.innerHTML = matches.map(match => `
+        <div class="match-item">
+
+            ${
+                match.image_path
+                ? `<img class="thumb"
+                        src="${escapeHtml(match.image_path)}">`
+                : ""
+            }
+
+            <strong>
+                ${escapeHtml(match.item_name)}
+            </strong>
+
+            <br>
+
+            <small>
+                ${escapeHtml(match.record_type)}
+                · ${escapeHtml(match.category)}
+                · ${escapeHtml(match.location)}
+                · ${escapeHtml(match.item_date)}
+            </small>
+
+            <br>
+
+            <span class="match-score">
+                Match Score: ${match.score}%
+            </span>
+
+        </div>
+    `).join("");
+}
+
+
+async function viewItem(id) {
+    const response =
+        await fetch(`/api/items/${id}`);
+
+    const item = await response.json();
+
+    alert(
+        "ITEM DETAILS\n\n" +
+        "Type: " + item.record_type + "\n" +
+        "Item: " + item.item_name + "\n" +
+        "Category: " + item.category + "\n" +
+        "Colour: " + (item.colour || "-") + "\n" +
+        "Location: " + item.location + "\n" +
+        "Date: " + item.item_date + "\n" +
+        "Condition: " + (item.item_condition || "-") + "\n" +
+        "Reporter: " + (item.reporter_name || "-") + "\n" +
+        "Features: " +
+        (item.identifying_features || "-") +
+        "\n\nDescription: " +
+        (item.description || "-") +
+        "\n\nContact: " +
+        (item.contact || "-") +
+        "\nStatus: " + item.status +
+        "\nClaimed By: " +
+        (item.claimed_by || "-")
+    );
+}
+
+
+async function editItem(id) {
+    const response =
+        await fetch(`/api/items/${id}`);
+
+    const item = await response.json();
+
+    editingId = id;
+
+    document.getElementById("record_type").value =
+        item.record_type;
+
+    document.getElementById("item_name").value =
+        item.item_name;
+
+    document.getElementById("category").value =
+        item.category;
+
+    document.getElementById("colour").value =
+        item.colour || "";
+
+    document.getElementById("location").value =
+        item.location;
+
+    document.getElementById("item_date").value =
+        item.item_date;
+
+    document.getElementById("item_condition").value =
+        item.item_condition || "";
+
+    document.getElementById("reporter_name").value =
+        item.reporter_name || "";
+
+    document.getElementById("identifying_features").value =
+        item.identifying_features || "";
+
+    document.getElementById("description").value =
+        item.description || "";
+
+    document.getElementById("contact").value =
+        item.contact || "";
+
+    document.getElementById("formTitle").innerText =
+        "Edit Lost / Found Item";
+
+    document.getElementById("saveButton").innerText =
+        "Update Item";
+
+    window.scrollTo({
+        top:0,
+        behavior:"smooth"
+    });
+}
+
+
+async function deleteItem(id) {
+    if (!confirm(
+        "Are you sure you want to delete this item?"
+    )) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}`,
+            {method:"DELETE"}
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item deleted successfully.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+async function resolveItem(id) {
+    const name = prompt(
+        "Enter claimant / receiver name (optional):"
+    );
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}/resolve`,
+            {
+                method:"PUT",
+                headers:{
+                    "Content-Type":"application/json"
+                },
+                body:JSON.stringify({
+                    claimed_by:name || ""
+                })
+            }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item marked as resolved.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+async function claimItem(id) {
+    const name = prompt("Enter claimant name:");
+
+    if (name === null) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}/claim`,
+            {
+                method:"PUT",
+                headers:{
+                    "Content-Type":"application/json"
+                },
+                body:JSON.stringify({
+                    claimed_by:name
+                })
+            }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item marked as claimed.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+function resetForm(clearMatch=true) {
+    document.getElementById("itemForm").reset();
+
+    editingId = null;
+
+    document.getElementById("formTitle").innerText =
+        "Report Lost / Found Item";
+
+    document.getElementById("saveButton").innerText =
+        "Save Item";
+
+    document.getElementById("item_date").value =
+        new Date().toISOString().split("T")[0];
+
+    const preview =
+        document.getElementById("imagePreview");
+
+    preview.src = "";
+    preview.style.display = "none";
+
+    if (clearMatch) {
+        document.getElementById("matchBox")
+            .style.display = "none";
+    }
+}
+
+
+function clearFilters() {
+    document.getElementById("search").value = "";
+    document.getElementById("filterType").value = "";
+    document.getElementById("filterCategory").value = "";
+    document.getElementById("filterLocation").value = "";
+    document.getElementById("filterStatus").value = "";
+    displayItems();
+}
+
+
+function updateStats() {
+    document.getElementById("totalRecords").innerText =
+        allItems.length;
+
+    document.getElementById("lostItems").innerText =
+        allItems.filter(
+            x => x.record_type === "Lost Item"
+        ).length;
+
+    document.getElementById("foundItems").innerText =
+        allItems.filter(
+            x => x.record_type === "Found Item"
+        ).length;
+
+    document.getElementById("activeItems").innerText =
+        allItems.filter(
+            x => x.status === "Active"
+        ).length;
+
+    document.getElementById("resolvedItems").innerText =
+        allItems.filter(
+            x => x.status === "Resolved" ||
+                 x.status === "Claimed"
+        ).length;
+}
+
+
+async function loadAnalytics() {
+    try {
+        const response =
+            await fetch("/api/analytics");
+
+        const data = await response.json();
+
+        document.getElementById("matchRate").innerText =
+            data.match_rate + "%";
+
+        document.getElementById("categoryAnalytics")
+            .innerHTML =
+            data.categories.length
+            ? data.categories.map(x => `
+                <div>
+                    <span>${escapeHtml(x.category)}</span>
+                    <strong>${x.count}</strong>
+                </div>
+            `).join("")
+            : "<p>No data yet.</p>";
+
+        document.getElementById("locationAnalytics")
+            .innerHTML =
+            data.locations.length
+            ? data.locations.map(x => `
+                <div>
+                    <span>${escapeHtml(x.location)}</span>
+                    <strong>${x.count}</strong>
+                </div>
+            `).join("")
+            : "<p>No data yet.</p>";
+
+    } catch(error) {
+        console.error(error);
+    }
+}
+
+
+async function loadNotifications() {
+    try {
+        const response =
+            await fetch("/api/notifications");
+
+        const data = await response.json();
+
+        const badge =
+            document.getElementById("notificationCount");
+
+        badge.innerText = data.unread;
+        badge.style.display =
+            data.unread ? "flex" : "none";
+
+        const list =
+            document.getElementById("notificationList");
+
+        if (!data.notifications.length) {
+            list.innerHTML =
+                "<p style='color:#718096;'>No notifications yet.</p>";
+            return;
+        }
+
+        list.innerHTML =
+            data.notifications.map(n => `
+                <div class="notification">
+                    <strong>${escapeHtml(n.notification_type)}</strong>
+                    <br>
+                    ${escapeHtml(n.message)}
+                    <br>
+                    <small>${escapeHtml(n.created_at)}</small>
+                </div>
+            `).join("");
+
+    } catch(error) {
+        console.error(error);
+    }
+}
+
+
+function toggleNotifications() {
+    const panel =
+        document.getElementById("notificationPanel");
+
+    panel.style.display =
+        panel.style.display === "block"
+        ? "none"
+        : "block";
+
+    loadNotifications();
+}
+
+
+async function markNotificationsRead() {
+    await fetch(
+        "/api/notifications/read",
+        {method:"PUT"}
+    );
+
+    loadNotifications();
+}
+
+
+function toggleDarkMode() {
+    document.body.classList.toggle("dark");
+
+    const dark =
+        document.body.classList.contains("dark");
+
+    localStorage.setItem(
+        "findlyDarkMode",
+        dark ? "1" : "0"
+    );
+
+    document.getElementById("themeButton")
+        .innerText = dark ? "☀️" : "🌙";
+}
+
+
+if (localStorage.getItem("findlyDarkMode") === "1") {
+    document.body.classList.add("dark");
+    document.getElementById("themeButton")
+        .innerText = "☀️";
+}
+
+
+document.getElementById("item_date").value =
+    new Date().toISOString().split("T")[0];
+
+loadItems();
+loadNotifications();
+loadAnalytics();
+</script>
+
+</body>
+</html>
+"""
+
+
+# =======
+from flask import Flask, request, jsonify, render_template_string
+import sqlite3
+import os
+import base64
+import uuid
+from datetime import datetime
+from difflib import SequenceMatcher
+
+app = Flask(__name__)
+
+DATABASE = "lost_found.db"
+UPLOAD_FOLDER = os.path.join("static", "uploads")
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+
+
+# =========================================================
+# DATABASE
+# =========================================================
+
+def get_db():
+    db = sqlite3.connect(DATABASE)
+    db.row_factory = sqlite3.Row
+    return db
+
+
+def create_database():
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+    db = get_db()
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_type TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            colour TEXT,
+            location TEXT NOT NULL,
+            item_date TEXT NOT NULL,
+            description TEXT,
+            contact TEXT,
+            status TEXT DEFAULT 'Active',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            image_path TEXT,
+            reporter_name TEXT,
+            item_condition TEXT,
+            identifying_features TEXT,
+            claimed_by TEXT,
+            resolved_at TEXT
+        )
+    """)
+
+    columns = {
+        row["name"]
+        for row in db.execute("PRAGMA table_info(items)").fetchall()
+    }
+
+    extra = {
+        "image_path": "TEXT",
+        "reporter_name": "TEXT",
+        "item_condition": "TEXT",
+        "identifying_features": "TEXT",
+        "claimed_by": "TEXT",
+        "resolved_at": "TEXT"
+    }
+
+    for name, definition in extra.items():
+        if name not in columns:
+            db.execute(
+                f"ALTER TABLE items ADD COLUMN {name} {definition}"
+            )
+
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER,
+            message TEXT NOT NULL,
+            notification_type TEXT DEFAULT 'Match',
+            is_read INTEGER DEFAULT 0,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    db.commit()
+    db.close()
+
+
+create_database()
+
+
+# =========================================================
+# HELPERS
+# =========================================================
+
+def normal(value):
+    return str(value or "").strip().lower()
+
+
+def similarity(a, b):
+    a = normal(a)
+    b = normal(b)
+
+    if not a or not b:
+        return 0
+
+    if a == b:
+        return 1
+
+    ratio = SequenceMatcher(None, a, b).ratio()
+
+    wa = set(a.split())
+    wb = set(b.split())
+    common = wa.intersection(wb)
+
+    word_score = (
+        len(common) / max(len(wa), len(wb))
+        if wa and wb else 0
+    )
+
+    if a in b or b in a:
+        ratio = max(ratio, 0.90)
+
+    return max(ratio, word_score)
+
+
+def date_similarity(a, b):
+    if not a or not b:
+        return 0
+
+    if a == b:
+        return 1
+
+    try:
+        d1 = datetime.strptime(a, "%Y-%m-%d")
+        d2 = datetime.strptime(b, "%Y-%m-%d")
+        days = abs((d1 - d2).days)
+
+        if days == 1:
+            return 0.70
+        if days <= 3:
+            return 0.40
+    except ValueError:
+        pass
+
+    return 0
+
+
+def save_image(data_url):
+    if not data_url:
+        return ""
+
+    if not data_url.startswith("data:image/"):
+        raise ValueError("Invalid image.")
+
+    try:
+        header, encoded = data_url.split(",", 1)
+        raw = base64.b64decode(encoded)
+
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise ValueError("Image must be 2 MB or smaller.")
+
+        if "image/png" in header:
+            ext = ".png"
+        elif "image/jpeg" in header or "image/jpg" in header:
+            ext = ".jpg"
+        elif "image/webp" in header:
+            ext = ".webp"
+        else:
+            raise ValueError("Only PNG, JPG and WEBP are supported.")
+
+        filename = uuid.uuid4().hex + ext
+        path = os.path.join(UPLOAD_FOLDER, filename)
+
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        return "/static/uploads/" + filename
+
+    except ValueError:
+        raise
+    except Exception:
+        raise ValueError("Could not process image.")
+
+
+def delete_image(path):
+    if not path or not path.startswith("/static/uploads/"):
+        return
+
+    local = path.lstrip("/").replace("/", os.sep)
+
+    if os.path.exists(local):
+        try:
+            os.remove(local)
+        except OSError:
+            pass
+
+
+# =========================================================
+# SMART MATCHING
+# =========================================================
+
+def find_matches(new_item):
+    db = get_db()
+
+    opposite = (
+        "Found Item"
+        if new_item["record_type"] == "Lost Item"
+        else "Lost Item"
+    )
+
+    rows = db.execute("""
+        SELECT * FROM items
+        WHERE record_type = ?
+          AND status = 'Active'
+          AND id != ?
+    """, (opposite, new_item.get("id", -1))).fetchall()
+
+    matches = []
+
+    for row in rows:
+        score = 0
+
+        # Name 30%
+        score += round(
+            similarity(new_item.get("item_name"), row["item_name"]) * 30
+        )
+
+        # Category 20%
+        if normal(new_item.get("category")) == normal(row["category"]):
+            score += 20
+
+        # Colour 15%
+        c1 = normal(new_item.get("colour"))
+        c2 = normal(row["colour"])
+
+        if c1 and c2:
+            if c1 == c2:
+                score += 15
+            elif similarity(c1, c2) >= 0.70:
+                score += 8
+
+        # Location 20%
+        l1 = normal(new_item.get("location"))
+        l2 = normal(row["location"])
+
+        if l1 == l2:
+            score += 20
+        elif similarity(l1, l2) >= 0.75:
+            score += 10
+
+        # Date 15%
+        score += round(
+            date_similarity(
+                new_item.get("item_date"),
+                row["item_date"]
+            ) * 15
+        )
+
+        if score >= 40:
+            matches.append({
+                "id": row["id"],
+                "item_name": row["item_name"],
+                "record_type": row["record_type"],
+                "category": row["category"],
+                "colour": row["colour"],
+                "location": row["location"],
+                "item_date": row["item_date"],
+                "image_path": row["image_path"],
+                "score": min(score, 100)
+            })
+
+    db.close()
+
+    matches.sort(
+        key=lambda x: x["score"],
+        reverse=True
+    )
+
+    return matches[:10]
+
+
+def create_notifications(item, matches):
+    if not matches:
+        return
+
+    best = matches[0]
+    db = get_db()
+
+    db.execute("""
+        INSERT INTO notifications
+        (item_id, message, notification_type)
+        VALUES (?, ?, 'Match')
+    """, (
+        item["id"],
+        f"Possible match for '{item['item_name']}' "
+        f"with '{best['item_name']}' — {best['score']}% match."
+    ))
+
+    db.execute("""
+        INSERT INTO notifications
+        (item_id, message, notification_type)
+        VALUES (?, ?, 'Match')
+    """, (
+        best["id"],
+        f"A possible match was found for "
+        f"'{best['item_name']}' — {best['score']}% match."
+    ))
+
+    db.commit()
+    db.close()
+
+
+# =========================================================
+# PAGE
+# =========================================================
+
+@app.route("/")
+def home():
+    return render_template_string(HTML)
+
+
+# =========================================================
+# ITEMS
+# =========================================================
+
+@app.route("/api/items", methods=["GET"])
+def get_items():
+    db = get_db()
+
+    rows = db.execute("""
+        SELECT * FROM items
+        ORDER BY id DESC
+    """).fetchall()
+
+    db.close()
+
+    return jsonify([dict(row) for row in rows])
+
+
+@app.route("/api/items", methods=["POST"])
+def create_item():
+    data = request.get_json(silent=True)
+
+    if not data:
+        return jsonify({
+            "success": False,
+            "message": "No data received"
+        }), 400
+
+    required = [
+        "record_type",
+        "item_name",
+        "category",
+        "location",
+        "item_date"
+    ]
+
+    for field in required:
+        if not str(data.get(field, "")).strip():
+            return jsonify({
+                "success": False,
+                "message": f"{field} is required"
+            }), 400
+
+    try:
+        image_path = save_image(data.get("image_data", ""))
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 400
+
+    db = get_db()
+
+    cursor = db.execute("""
+        INSERT INTO items (
+            record_type, item_name, category, colour,
+            location, item_date, description, contact,
+            status, image_path, reporter_name,
+            item_condition, identifying_features
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Active', ?, ?, ?, ?)
+    """, (
+        data["record_type"],
+        data["item_name"].strip(),
+        data["category"],
+        data.get("colour", "").strip(),
+        data["location"],
+        data["item_date"],
+        data.get("description", "").strip(),
+        data.get("contact", "").strip(),
+        image_path,
+        data.get("reporter_name", "").strip(),
+        data.get("item_condition", ""),
+        data.get("identifying_features", "").strip()
+    ))
+
+    item_id = cursor.lastrowid
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    item = dict(row)
+    matches = find_matches(item)
+    create_notifications(item, matches)
+
+    return jsonify({
+        "success": True,
+        "message": "Item saved successfully",
+        "item": item,
+        "matches": matches
+    })
+
+
+@app.route("/api/items/<int:item_id>", methods=["GET"])
+def get_item(item_id):
+    db = get_db()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if not row:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify(dict(row))
+
+
+@app.route("/api/items/<int:item_id>", methods=["PUT"])
+def update_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    old = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    if not old:
+        db.close()
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    old_image = old["image_path"] or ""
+    image_path = old_image
+
+    try:
+        if data.get("image_data"):
+            image_path = save_image(data["image_data"])
+    except ValueError as e:
+        db.close()
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 400
+
+    db.execute("""
+        UPDATE items SET
+            record_type=?,
+            item_name=?,
+            category=?,
+            colour=?,
+            location=?,
+            item_date=?,
+            description=?,
+            contact=?,
+            image_path=?,
+            reporter_name=?,
+            item_condition=?,
+            identifying_features=?
+        WHERE id=?
+    """, (
+        data.get("record_type", ""),
+        data.get("item_name", "").strip(),
+        data.get("category", ""),
+        data.get("colour", "").strip(),
+        data.get("location", ""),
+        data.get("item_date", ""),
+        data.get("description", "").strip(),
+        data.get("contact", "").strip(),
+        image_path,
+        data.get("reporter_name", "").strip(),
+        data.get("item_condition", ""),
+        data.get("identifying_features", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if image_path != old_image:
+        delete_image(old_image)
+
+    return jsonify({
+        "success": True,
+        "message": "Item updated successfully",
+        "item": dict(row)
+    })
+
+
+@app.route("/api/items/<int:item_id>", methods=["DELETE"])
+def delete_item(item_id):
+    db = get_db()
+
+    old = db.execute(
+        "SELECT image_path FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    cursor = db.execute(
+        "DELETE FROM items WHERE id=?",
+        (item_id,)
+    )
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    if old:
+        delete_image(old["image_path"])
+
+    return jsonify({
+        "success": True,
+        "message": "Item deleted successfully"
+    })
+
+
+# =========================================================
+# RESOLVE / CLAIM
+# =========================================================
+
+@app.route("/api/items/<int:item_id>/resolve", methods=["PUT"])
+def resolve_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    cursor = db.execute("""
+        UPDATE items
+        SET status='Resolved',
+            claimed_by=?,
+            resolved_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (
+        data.get("claimed_by", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "message": "Item marked as resolved"
+    })
+
+
+@app.route("/api/items/<int:item_id>/claim", methods=["PUT"])
+def claim_item(item_id):
+    data = request.get_json(silent=True) or {}
+    db = get_db()
+
+    cursor = db.execute("""
+        UPDATE items
+        SET status='Claimed',
+            claimed_by=?,
+            resolved_at=CURRENT_TIMESTAMP
+        WHERE id=?
+    """, (
+        data.get("claimed_by", "").strip(),
+        item_id
+    ))
+
+    db.commit()
+    db.close()
+
+    if cursor.rowcount == 0:
+        return jsonify({
+            "success": False,
+            "message": "Item not found"
+        }), 404
+
+    return jsonify({
+        "success": True,
+        "message": "Item marked as claimed"
+    })
+
+
+# =========================================================
+# MATCHES
+# =========================================================
+
+@app.route("/api/matches/<int:item_id>")
+def matches(item_id):
+    db = get_db()
+
+    row = db.execute(
+        "SELECT * FROM items WHERE id=?",
+        (item_id,)
+    ).fetchone()
+
+    db.close()
+
+    if not row:
+        return jsonify([])
+
+    return jsonify(find_matches(dict(row)))
+
+
+# =========================================================
+# NOTIFICATIONS
+# =========================================================
+
+@app.route("/api/notifications")
+def notifications():
+    db = get_db()
+
+    rows = db.execute("""
+        SELECT *
+        FROM notifications
+        ORDER BY id DESC
+        LIMIT 30
+    """).fetchall()
+
+    unread = db.execute("""
+        SELECT COUNT(*) AS n
+        FROM notifications
+        WHERE is_read=0
+    """).fetchone()["n"]
+
+    db.close()
+
+    return jsonify({
+        "notifications": [dict(x) for x in rows],
+        "unread": unread
+    })
+
+
+@app.route("/api/notifications/read", methods=["PUT"])
+def notifications_read():
+    db = get_db()
+
+    db.execute(
+        "UPDATE notifications SET is_read=1 WHERE is_read=0"
+    )
+
+    db.commit()
+    db.close()
+
+    return jsonify({"success": True})
+
+
+# =========================================================
+# ANALYTICS
+# =========================================================
+
+@app.route("/api/analytics")
+def analytics():
+    db = get_db()
+
+    total = db.execute(
+        "SELECT COUNT(*) n FROM items"
+    ).fetchone()["n"]
+
+    lost = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE record_type='Lost Item'"
+    ).fetchone()["n"]
+
+    found = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE record_type='Found Item'"
+    ).fetchone()["n"]
+
+    active = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Active'"
+    ).fetchone()["n"]
+
+    resolved = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Resolved'"
+    ).fetchone()["n"]
+
+    claimed = db.execute(
+        "SELECT COUNT(*) n FROM items WHERE status='Claimed'"
+    ).fetchone()["n"]
+
+    match_notifications = db.execute("""
+        SELECT COUNT(*) n
+        FROM notifications
+        WHERE notification_type='Match'
+    """).fetchone()["n"]
+
+    categories = db.execute("""
+        SELECT category, COUNT(*) count
+        FROM items
+        GROUP BY category
+        ORDER BY count DESC
+    """).fetchall()
+
+    locations = db.execute("""
+        SELECT location, COUNT(*) count
+        FROM items
+        GROUP BY location
+        ORDER BY count DESC
+        LIMIT 8
+    """).fetchall()
+
+    db.close()
+
+    return jsonify({
+        "total": total,
+        "lost": lost,
+        "found": found,
+        "active": active,
+        "resolved": resolved,
+        "claimed": claimed,
+        "match_rate": round(
+            (match_notifications / total) * 100, 1
+        ) if total else 0,
+        "categories": [dict(x) for x in categories],
+        "locations": [dict(x) for x in locations]
+    })
+
+
+# =========================================================
+# FRONTEND
+# =========================================================
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FINDLY | Smart Lost & Found</title>
+
+<style>
+:root {
+    --bg:#f4f7fb;
+    --card:#fff;
+    --text:#172033;
+    --muted:#718096;
+    --border:#e2e8f0;
+    --soft:#f7f9fc;
+    --primary:#2f6fed;
+}
+
+* { box-sizing:border-box; }
+
+body {
+    margin:0;
+    font-family:Arial,Helvetica,sans-serif;
+    background:var(--bg);
+    color:var(--text);
+}
+
+body.dark {
+    --bg:#111827;
+    --card:#1f2937;
+    --text:#f3f4f6;
+    --muted:#aab4c5;
+    --border:#374151;
+    --soft:#273449;
+}
+
+header {
+    background:var(--card);
+    border-bottom:1px solid var(--border);
+    padding:16px 6%;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    position:sticky;
+    top:0;
+    z-index:50;
+}
+
+.logo {
+    display:flex;
+    align-items:center;
+    gap:10px;
+    font-size:23px;
+    font-weight:800;
+    color:var(--primary);
+}
+
+.logo-icon {
+    width:38px;
+    height:38px;
+    border-radius:10px;
+    background:var(--primary);
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+}
+
+.header-actions {
+    display:flex;
+    gap:8px;
+}
+
+button {
+    border:0;
+    border-radius:8px;
+    padding:10px 14px;
+    cursor:pointer;
+    font-weight:600;
+}
+
+.icon-btn,.secondary {
+    background:var(--soft);
+    color:var(--text);
+    border:1px solid var(--border);
+}
+
+.primary {
+    background:var(--primary);
+    color:#fff;
+}
+
+.danger {
+    background:#fff0f0;
+    color:#c53030;
+}
+
+.resolve {
+    background:#edf8f1;
+    color:#287d48;
+}
+
+.claim {
+    background:#f0eaff;
+    color:#6941c6;
+}
+
+.container {
+    width:88%;
+    max-width:1300px;
+    margin:30px auto;
+}
+
+.hero h1 {
+    margin:0;
+    font-size:34px;
+}
+
+.hero p {
+    color:var(--muted);
+}
+
+.stats {
+    display:grid;
+    grid-template-columns:repeat(6,1fr);
+    gap:12px;
+    margin:24px 0;
+}
+
+.stat,.card {
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:14px;
+}
+
+.stat {
+    padding:17px;
+}
+
+.stat-title {
+    color:var(--muted);
+    font-size:11px;
+    text-transform:uppercase;
+}
+
+.stat-value {
+    font-size:25px;
+    font-weight:700;
+    margin-top:7px;
+}
+
+.card {
+    padding:25px;
+    margin-bottom:22px;
+}
+
+.subtitle {
+    color:var(--muted);
+    font-size:14px;
+    margin-bottom:20px;
+}
+
+.form-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:17px;
+}
+
+.field {
+    display:flex;
+    flex-direction:column;
+}
+
+.full {
+    grid-column:1/-1;
+}
+
+label {
+    font-size:13px;
+    font-weight:600;
+    margin-bottom:7px;
+}
+
+input,select,textarea {
+    width:100%;
+    padding:12px 13px;
+    border:1px solid var(--border);
+    border-radius:8px;
+    background:var(--card);
+    color:var(--text);
+    outline:none;
+}
+
+textarea {
+    min-height:85px;
+    resize:vertical;
+}
+
+input:focus,select:focus,textarea:focus {
+    border-color:var(--primary);
+}
+
+.form-actions,.actions {
+    display:flex;
+    gap:7px;
+    flex-wrap:wrap;
+    margin-top:20px;
+}
+
+.actions { margin-top:0; }
+
+.filters {
+    display:grid;
+    grid-template-columns:2fr 1fr 1fr 1fr;
+    gap:10px;
+}
+
+.table-wrapper {
+    overflow-x:auto;
+}
+
+table {
+    width:100%;
+    border-collapse:collapse;
+    min-width:1050px;
+}
+
+th {
+    text-align:left;
+    padding:12px;
+    background:var(--soft);
+    color:var(--muted);
+    font-size:11px;
+    text-transform:uppercase;
+}
+
+td {
+    padding:12px;
+    border-top:1px solid var(--border);
+    font-size:13px;
+}
+
+.badge {
+    display:inline-block;
+    padding:5px 9px;
+    border-radius:20px;
+    font-size:10px;
+    font-weight:700;
+}
+
+.badge-lost {
+    background:#fff4e5;
+    color:#a85d00;
+}
+
+.badge-found {
+    background:#edf8f1;
+    color:#287d48;
+}
+
+.badge-resolved {
+    background:#eef1f5;
+    color:#667085;
+}
+
+.badge-claimed {
+    background:#f0eaff;
+    color:#6941c6;
+}
+
+.thumb {
+    width:48px;
+    height:48px;
+    object-fit:cover;
+    border-radius:7px;
+    border:1px solid var(--border);
+}
+
+.preview {
+    display:none;
+    margin-top:8px;
+    max-width:180px;
+    max-height:130px;
+    border-radius:8px;
+}
+
+.match-box {
+    display:none;
+    margin-top:20px;
+    padding:15px;
+    background:var(--soft);
+    border-left:4px solid var(--primary);
+    border-radius:8px;
+}
+
+.match-item {
+    background:var(--card);
+    border:1px solid var(--border);
+    border-radius:8px;
+    padding:12px;
+    margin-top:8px;
+}
+
+.match-score {
+    color:var(--primary);
+    font-weight:800;
+}
+
+.analytics-grid {
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:20px;
+}
+
+.analytics-list div {
+    display:flex;
+    justify-content:space-between;
+    padding:9px 0;
+    border-bottom:1px solid var(--border);
+}
+
+.notification-panel {
+    position:fixed;
+    right:20px;
+    top:72px;
+    width:min(390px,calc(100vw - 30px));
+    max-height:70vh;
+    overflow:auto;
+    background:var(--card);
+    border:1px solid var(--border);
+    box-shadow:0 15px 40px rgba(0,0,0,.18);
+    border-radius:12px;
+    z-index:100;
+    display:none;
+    padding:16px;
+}
+
+.notification {
+    padding:11px 0;
+    border-bottom:1px solid var(--border);
+    font-size:13px;
+}
+
+.notification-btn {
+    position:relative;
+}
+
+.notification-count {
+    position:absolute;
+    right:-5px;
+    top:-6px;
+    background:#e53e3e;
+    color:#fff;
+    min-width:18px;
+    height:18px;
+    border-radius:20px;
+    display:none;
+    align-items:center;
+    justify-content:center;
+    font-size:10px;
+}
+
+.empty {
+    text-align:center;
+    padding:40px;
+    color:var(--muted);
+}
+
+.small-note {
+    color:var(--muted);
+    font-size:11px;
+    margin-top:5px;
+}
+
+.toast {
+    position:fixed;
+    right:20px;
+    bottom:20px;
+    background:#172b4d;
+    color:#fff;
+    padding:12px 17px;
+    border-radius:8px;
+    display:none;
+    z-index:999;
+}
+
+@media(max-width:1050px) {
+    .stats { grid-template-columns:repeat(3,1fr); }
+    .filters { grid-template-columns:1fr 1fr; }
+}
+
+@media(max-width:750px) {
+    .container { width:94%; }
+    .stats { grid-template-columns:1fr 1fr; }
+    .form-grid { grid-template-columns:1fr; }
+    .full { grid-column:auto; }
+    .filters { grid-template-columns:1fr; }
+    .analytics-grid { grid-template-columns:1fr; }
+    .header-text { display:none; }
+    .hero h1 { font-size:28px; }
+}
+</style>
+</head>
+
+<body>
+
+<header>
+    <div class="logo">
+        <div class="logo-icon">✓</div>
+        FINDLY
+    </div>
+
+    <div class="header-text">
+        Smart Lost & Found Management System
+    </div>
+
+    <div class="header-actions">
+        <button class="icon-btn notification-btn"
+                onclick="toggleNotifications()">
+            🔔
+            <span id="notificationCount"
+                  class="notification-count">0</span>
+        </button>
+
+        <button class="icon-btn"
+                id="themeButton"
+                onclick="toggleDarkMode()">
+            🌙
+        </button>
+    </div>
+</header>
+
+<div id="notificationPanel" class="notification-panel">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+        <strong>Notifications</strong>
+        <button class="secondary"
+                onclick="markNotificationsRead()">
+            Mark read
+        </button>
+    </div>
+    <div id="notificationList"></div>
+</div>
+
+<div class="container">
+
+    <div class="hero">
+        <h1>Smart Lost & Found</h1>
+        <p>
+            Report, manage and intelligently identify possible matches.
+        </p>
+    </div>
+
+    <div class="stats">
+        <div class="stat">
+            <div class="stat-title">Total Records</div>
+            <div class="stat-value" id="totalRecords">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Lost Items</div>
+            <div class="stat-value" id="lostItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Found Items</div>
+            <div class="stat-value" id="foundItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Active Items</div>
+            <div class="stat-value" id="activeItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Resolved / Claimed</div>
+            <div class="stat-value" id="resolvedItems">0</div>
+        </div>
+        <div class="stat">
+            <div class="stat-title">Match Rate</div>
+            <div class="stat-value" id="matchRate">0%</div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2 id="formTitle">Report Lost / Found Item</h2>
+        <div class="subtitle">
+            Add complete details to improve matching accuracy.
+        </div>
+
+        <form id="itemForm">
+
+            <div class="form-grid">
+
+                <div class="field">
+                    <label>Record Type *</label>
+                    <select id="record_type" required>
+                        <option>Lost Item</option>
+                        <option>Found Item</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Item Name *</label>
+                    <input id="item_name"
+                           placeholder="Example: Black Wallet"
+                           required>
+                </div>
+
+                <div class="field">
+                    <label>Category *</label>
+                    <select id="category" required>
+                        <option value="">Select Category</option>
+                        <option>Wallet</option>
+                        <option>Mobile Phone</option>
+                        <option>Laptop</option>
+                        <option>Bag</option>
+                        <option>ID Card</option>
+                        <option>Keys</option>
+                        <option>Book</option>
+                        <option>Earphones</option>
+                        <option>Watch</option>
+                        <option>Water Bottle</option>
+                        <option>Umbrella</option>
+                        <option>Other</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Colour</label>
+                    <input id="colour" placeholder="Example: Black">
+                </div>
+
+                <div class="field">
+                    <label>College Location *</label>
+                    <select id="location" required>
+                        <option value="">Select Location</option>
+                        <option>College Canteen</option>
+                        <option>Library</option>
+                        <option>Computer Lab</option>
+                        <option>Classroom</option>
+                        <option>Seminar Hall</option>
+                        <option>Auditorium</option>
+                        <option>Parking Area</option>
+                        <option>Hostel</option>
+                        <option>Bus / Transport</option>
+                        <option>Sports Ground</option>
+                        <option>Administrative Block</option>
+                        <option>Department Block</option>
+                        <option>Other</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Date *</label>
+                    <input id="item_date" type="date" required>
+                </div>
+
+                <div class="field">
+                    <label>Condition</label>
+                    <select id="item_condition">
+                        <option value="">Select Condition</option>
+                        <option>New</option>
+                        <option>Good</option>
+                        <option>Used</option>
+                        <option>Damaged</option>
+                        <option>Unknown</option>
+                    </select>
+                </div>
+
+                <div class="field">
+                    <label>Reporter Name</label>
+                    <input id="reporter_name"
+                           placeholder="Your name">
+                </div>
+
+                <div class="field full">
+                    <label>Identifying Features</label>
+                    <input id="identifying_features"
+                           placeholder="Sticker, initials, scratch, cover, unique mark...">
+                </div>
+
+                <div class="field full">
+                    <label>Description</label>
+                    <textarea id="description"
+                              placeholder="Describe the item..."></textarea>
+                </div>
+
+                <div class="field">
+                    <label>Contact</label>
+                    <input id="contact"
+                           placeholder="Phone / Email">
+                </div>
+
+                <div class="field">
+                    <label>Item Photo</label>
+                    <input id="image"
+                           type="file"
+                           accept="image/png,image/jpeg,image/webp"
+                           onchange="previewImage()">
+                    <img id="imagePreview" class="preview">
+                    <div class="small-note">
+                        PNG/JPG/WEBP, maximum 2 MB
+                    </div>
+                </div>
+
+            </div>
+
+            <div class="form-actions">
+                <button class="primary"
+                        type="submit"
+                        id="saveButton">
+                    Save Item
+                </button>
+
+                <button class="secondary"
+                        type="button"
+                        onclick="resetForm()">
+                    Clear
+                </button>
+            </div>
+
+        </form>
+
+        <div class="match-box" id="matchBox">
+            <strong>🎯 Possible Matching Items</strong>
+            <div id="matchResults"></div>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>🔍 Advanced Search & Filters</h2>
+
+        <div class="filters">
+
+            <input id="search"
+                   placeholder="Search item, category, location..."
+                   oninput="displayItems()">
+
+            <select id="filterType" onchange="displayItems()">
+                <option value="">All Types</option>
+                <option>Lost Item</option>
+                <option>Found Item</option>
+            </select>
+
+            <select id="filterCategory" onchange="displayItems()">
+                <option value="">All Categories</option>
+                <option>Wallet</option>
+                <option>Mobile Phone</option>
+                <option>Laptop</option>
+                <option>Bag</option>
+                <option>ID Card</option>
+                <option>Keys</option>
+                <option>Book</option>
+                <option>Earphones</option>
+                <option>Watch</option>
+                <option>Other</option>
+            </select>
+
+            <select id="filterLocation" onchange="displayItems()">
+                <option value="">All Locations</option>
+                <option>College Canteen</option>
+                <option>Library</option>
+                <option>Computer Lab</option>
+                <option>Classroom</option>
+                <option>Seminar Hall</option>
+                <option>Auditorium</option>
+                <option>Parking Area</option>
+                <option>Hostel</option>
+                <option>Bus / Transport</option>
+                <option>Sports Ground</option>
+                <option>Administrative Block</option>
+                <option>Department Block</option>
+                <option>Other</option>
+            </select>
+
+        </div>
+
+        <br>
+
+        <select id="filterStatus"
+                onchange="displayItems()"
+                style="max-width:250px;">
+            <option value="">All Status</option>
+            <option>Active</option>
+            <option>Resolved</option>
+            <option>Claimed</option>
+        </select>
+
+        <button class="secondary"
+                onclick="clearFilters()">
+            Clear Filters
+        </button>
+    </div>
+
+    <div class="card">
+        <h2>📋 Item Records</h2>
+        <div class="subtitle">
+            Manage all reported items.
+        </div>
+
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Photo</th>
+                        <th>ID</th>
+                        <th>Type</th>
+                        <th>Item</th>
+                        <th>Category</th>
+                        <th>Colour</th>
+                        <th>Location</th>
+                        <th>Date</th>
+                        <th>Status</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+
+                <tbody id="itemTable"></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="card">
+        <h2>📊 Admin Analytics Dashboard</h2>
+        <div class="subtitle">
+            Quick overview of FINDLY activity.
+        </div>
+
+        <div class="analytics-grid">
+
+            <div>
+                <h3>Top Categories</h3>
+                <div id="categoryAnalytics"
+                     class="analytics-list"></div>
+            </div>
+
+            <div>
+                <h3>Top Locations</h3>
+                <div id="locationAnalytics"
+                     class="analytics-list"></div>
+            </div>
+
+        </div>
+    </div>
+
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let allItems = [];
+let editingId = null;
+
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+
+function showToast(message) {
+    const toast = document.getElementById("toast");
+    toast.innerText = message;
+    toast.style.display = "block";
+
+    setTimeout(() => {
+        toast.style.display = "none";
+    }, 2800);
+}
+
+
+async function loadItems() {
+    try {
+        const response = await fetch("/api/items");
+
+        if (!response.ok) {
+            throw new Error("Server error");
+        }
+
+        allItems = await response.json();
+
+        displayItems();
+        updateStats();
+        loadAnalytics();
+        loadNotifications();
+
+    } catch (error) {
+        console.error(error);
+        showToast("Unable to load records.");
+    }
+}
+
+
+function displayItems() {
+    const table = document.getElementById("itemTable");
+
+    const search = document
+        .getElementById("search")
+        .value
+        .toLowerCase()
+        .trim();
+
+    const type =
+        document.getElementById("filterType").value;
+
+    const category =
+        document.getElementById("filterCategory").value;
+
+    const location =
+        document.getElementById("filterLocation").value;
+
+    const status =
+        document.getElementById("filterStatus").value;
+
+    const filtered = allItems.filter(item => {
+
+        const text = [
+            item.item_name,
+            item.category,
+            item.location,
+            item.record_type,
+            item.colour,
+            item.description,
+            item.identifying_features,
+            item.reporter_name
+        ].join(" ").toLowerCase();
+
+        return (
+            text.includes(search) &&
+            (!type || item.record_type === type) &&
+            (!category || item.category === category) &&
+            (!location || item.location === location) &&
+            (!status || item.status === status)
+        );
+    });
+
+    if (!filtered.length) {
+        table.innerHTML = `
+            <tr>
+                <td colspan="10" class="empty">
+                    No records found.
+                </td>
+            </tr>
+        `;
+        return;
+    }
+
+    table.innerHTML = filtered.map(item => {
+
+        let statusClass = "badge-found";
+
+        if (item.status === "Resolved") {
+            statusClass = "badge-resolved";
+        }
+
+        if (item.status === "Claimed") {
+            statusClass = "badge-claimed";
+        }
+
+        const typeClass =
+            item.record_type === "Lost Item"
+            ? "badge-lost"
+            : "badge-found";
+
+        return `
+            <tr>
+
+                <td>
+                    ${
+                        item.image_path
+                        ? `<img class="thumb"
+                                src="${escapeHtml(item.image_path)}">`
+                        : "—"
+                    }
+                </td>
+
+                <td>${item.id}</td>
+
+                <td>
+                    <span class="badge ${typeClass}">
+                        ${escapeHtml(item.record_type)}
+                    </span>
+                </td>
+
+                <td>
+                    <strong>
+                        ${escapeHtml(item.item_name)}
+                    </strong>
+                </td>
+
+                <td>${escapeHtml(item.category)}</td>
+
+                <td>${escapeHtml(item.colour || "-")}</td>
+
+                <td>${escapeHtml(item.location)}</td>
+
+                <td>${escapeHtml(item.item_date)}</td>
+
+                <td>
+                    <span class="badge ${statusClass}">
+                        ${escapeHtml(item.status)}
+                    </span>
+                </td>
+
+                <td>
+                    <div class="actions">
+
+                        <button class="secondary"
+                                onclick="viewItem(${item.id})">
+                            View
+                        </button>
+
+                        <button class="primary"
+                                onclick="editItem(${item.id})">
+                            Edit
+                        </button>
+
+                        ${
+                            item.status === "Active"
+                            ? `
+                            <button class="resolve"
+                                    onclick="resolveItem(${item.id})">
+                                Resolve
+                            </button>
+
+                            <button class="claim"
+                                    onclick="claimItem(${item.id})">
+                                Claim
+                            </button>
+                            `
+                            : ""
+                        }
+
+                        <button class="danger"
+                                onclick="deleteItem(${item.id})">
+                            Delete
+                        </button>
+
+                    </div>
+                </td>
+
+            </tr>
+        `;
+    }).join("");
+}
+
+
+function fileToDataUrl(file) {
+    if (!file) {
+        return Promise.resolve("");
+    }
+
+    if (file.size > 2 * 1024 * 1024) {
+        return Promise.reject(
+            new Error("Image must be 2 MB or smaller.")
+        );
+    }
+
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () =>
+            reject(new Error("Could not read image."));
+
+        reader.readAsDataURL(file);
+    });
+}
+
+
+function previewImage() {
+    const input = document.getElementById("image");
+    const preview = document.getElementById("imagePreview");
+
+    if (!input.files.length) {
+        preview.style.display = "none";
+        return;
+    }
+
+    if (input.files[0].size > 2 * 1024 * 1024) {
+        showToast("Image must be 2 MB or smaller.");
+        input.value = "";
+        preview.style.display = "none";
+        return;
+    }
+
+    preview.src =
+        URL.createObjectURL(input.files[0]);
+
+    preview.style.display = "block";
+}
+
+
+document.getElementById("itemForm")
+.addEventListener("submit", async event => {
+
+    event.preventDefault();
+
+    const button =
+        document.getElementById("saveButton");
+
+    button.disabled = true;
+    button.innerText =
+        editingId ? "Updating..." : "Saving...";
+
+    try {
+
+        const image =
+            document.getElementById("image").files[0];
+
+        const imageData =
+            await fileToDataUrl(image);
+
+        const data = {
+            record_type:
+                document.getElementById("record_type").value,
+
+            item_name:
+                document.getElementById("item_name").value.trim(),
+
+            category:
+                document.getElementById("category").value,
+
+            colour:
+                document.getElementById("colour").value.trim(),
+
+            location:
+                document.getElementById("location").value,
+
+            item_date:
+                document.getElementById("item_date").value,
+
+            item_condition:
+                document.getElementById("item_condition").value,
+
+            reporter_name:
+                document.getElementById("reporter_name").value.trim(),
+
+            identifying_features:
+                document
+                .getElementById("identifying_features")
+                .value.trim(),
+
+            description:
+                document.getElementById("description").value.trim(),
+
+            contact:
+                document.getElementById("contact").value.trim(),
+
+            image_data: imageData
+        };
+
+        let response;
+
+        if (editingId) {
+
+            response = await fetch(
+                `/api/items/${editingId}`,
+                {
+                    method:"PUT",
+                    headers:{
+                        "Content-Type":"application/json"
+                    },
+                    body:JSON.stringify(data)
+                }
+            );
+
+        } else {
+
+            response = await fetch(
+                "/api/items",
+                {
+                    method:"POST",
+                    headers:{
+                        "Content-Type":"application/json"
+                    },
+                    body:JSON.stringify(data)
+                }
+            );
+        }
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(
+                result.message || "Operation failed"
+            );
+        }
+
+        if (editingId) {
+            showToast("Item updated successfully.");
+        } else {
+            showToast("Item saved successfully.");
+
+            if (result.matches &&
+                result.matches.length) {
+                showMatches(result.matches);
+                showToast(
+                    "Item saved — possible match found!"
+                );
+            }
+        }
+
+        editingId = null;
+        resetForm(false);
+        await loadItems();
+
+    } catch (error) {
+        console.error(error);
+        showToast(error.message);
+
+    } finally {
+        button.disabled = false;
+        button.innerText = "Save Item";
+    }
+});
+
+
+function showMatches(matches) {
+    const box =
+        document.getElementById("matchBox");
+
+    const results =
+        document.getElementById("matchResults");
+
+    box.style.display = "block";
+
+    if (!matches.length) {
+        results.innerHTML =
+            "<p>No possible matches found.</p>";
+        return;
+    }
+
+    results.innerHTML = matches.map(match => `
+        <div class="match-item">
+
+            ${
+                match.image_path
+                ? `<img class="thumb"
+                        src="${escapeHtml(match.image_path)}">`
+                : ""
+            }
+
+            <strong>
+                ${escapeHtml(match.item_name)}
+            </strong>
+
+            <br>
+
+            <small>
+                ${escapeHtml(match.record_type)}
+                · ${escapeHtml(match.category)}
+                · ${escapeHtml(match.location)}
+                · ${escapeHtml(match.item_date)}
+            </small>
+
+            <br>
+
+            <span class="match-score">
+                Match Score: ${match.score}%
+            </span>
+
+        </div>
+    `).join("");
+}
+
+
+async function viewItem(id) {
+    const response =
+        await fetch(`/api/items/${id}`);
+
+    const item = await response.json();
+
+    alert(
+        "ITEM DETAILS\n\n" +
+        "Type: " + item.record_type + "\n" +
+        "Item: " + item.item_name + "\n" +
+        "Category: " + item.category + "\n" +
+        "Colour: " + (item.colour || "-") + "\n" +
+        "Location: " + item.location + "\n" +
+        "Date: " + item.item_date + "\n" +
+        "Condition: " + (item.item_condition || "-") + "\n" +
+        "Reporter: " + (item.reporter_name || "-") + "\n" +
+        "Features: " +
+        (item.identifying_features || "-") +
+        "\n\nDescription: " +
+        (item.description || "-") +
+        "\n\nContact: " +
+        (item.contact || "-") +
+        "\nStatus: " + item.status +
+        "\nClaimed By: " +
+        (item.claimed_by || "-")
+    );
+}
+
+
+async function editItem(id) {
+    const response =
+        await fetch(`/api/items/${id}`);
+
+    const item = await response.json();
+
+    editingId = id;
+
+    document.getElementById("record_type").value =
+        item.record_type;
+
+    document.getElementById("item_name").value =
+        item.item_name;
+
+    document.getElementById("category").value =
+        item.category;
+
+    document.getElementById("colour").value =
+        item.colour || "";
+
+    document.getElementById("location").value =
+        item.location;
+
+    document.getElementById("item_date").value =
+        item.item_date;
+
+    document.getElementById("item_condition").value =
+        item.item_condition || "";
+
+    document.getElementById("reporter_name").value =
+        item.reporter_name || "";
+
+    document.getElementById("identifying_features").value =
+        item.identifying_features || "";
+
+    document.getElementById("description").value =
+        item.description || "";
+
+    document.getElementById("contact").value =
+        item.contact || "";
+
+    document.getElementById("formTitle").innerText =
+        "Edit Lost / Found Item";
+
+    document.getElementById("saveButton").innerText =
+        "Update Item";
+
+    window.scrollTo({
+        top:0,
+        behavior:"smooth"
+    });
+}
+
+
+async function deleteItem(id) {
+    if (!confirm(
+        "Are you sure you want to delete this item?"
+    )) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}`,
+            {method:"DELETE"}
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item deleted successfully.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+async function resolveItem(id) {
+    const name = prompt(
+        "Enter claimant / receiver name (optional):"
+    );
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}/resolve`,
+            {
+                method:"PUT",
+                headers:{
+                    "Content-Type":"application/json"
+                },
+                body:JSON.stringify({
+                    claimed_by:name || ""
+                })
+            }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item marked as resolved.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+async function claimItem(id) {
+    const name = prompt("Enter claimant name:");
+
+    if (name === null) {
+        return;
+    }
+
+    try {
+        const response = await fetch(
+            `/api/items/${id}/claim`,
+            {
+                method:"PUT",
+                headers:{
+                    "Content-Type":"application/json"
+                },
+                body:JSON.stringify({
+                    claimed_by:name
+                })
+            }
+        );
+
+        const result = await response.json();
+
+        if (!response.ok) {
+            throw new Error(result.message);
+        }
+
+        showToast("Item marked as claimed.");
+        await loadItems();
+
+    } catch(error) {
+        showToast(error.message);
+    }
+}
+
+
+function resetForm(clearMatch=true) {
+    document.getElementById("itemForm").reset();
+
+    editingId = null;
+
+    document.getElementById("formTitle").innerText =
+        "Report Lost / Found Item";
+
+    document.getElementById("saveButton").innerText =
+        "Save Item";
+
+    document.getElementById("item_date").value =
+        new Date().toISOString().split("T")[0];
+
+    const preview =
+        document.getElementById("imagePreview");
+
+    preview.src = "";
+    preview.style.display = "none";
+
+    if (clearMatch) {
+        document.getElementById("matchBox")
+            .style.display = "none";
+    }
+}
+
+
+function clearFilters() {
+    document.getElementById("search").value = "";
+    document.getElementById("filterType").value = "";
+    document.getElementById("filterCategory").value = "";
+    document.getElementById("filterLocation").value = "";
+    document.getElementById("filterStatus").value = "";
+    displayItems();
+}
+
+
+function updateStats() {
+    document.getElementById("totalRecords").innerText =
+        allItems.length;
+
+    document.getElementById("lostItems").innerText =
+        allItems.filter(
+            x => x.record_type === "Lost Item"
+        ).length;
+
+    document.getElementById("foundItems").innerText =
+        allItems.filter(
+            x => x.record_type === "Found Item"
+        ).length;
+
+    document.getElementById("activeItems").innerText =
+        allItems.filter(
+            x => x.status === "Active"
+        ).length;
+
+    document.getElementById("resolvedItems").innerText =
+        allItems.filter(
+            x => x.status === "Resolved" ||
+                 x.status === "Claimed"
+        ).length;
+}
+
+
+async function loadAnalytics() {
+    try {
+        const response =
+            await fetch("/api/analytics");
+
+        const data = await response.json();
+
+        document.getElementById("matchRate").innerText =
+            data.match_rate + "%";
+
+        document.getElementById("categoryAnalytics")
+            .innerHTML =
+            data.categories.length
+            ? data.categories.map(x => `
+                <div>
+                    <span>${escapeHtml(x.category)}</span>
+                    <strong>${x.count}</strong>
+                </div>
+            `).join("")
+            : "<p>No data yet.</p>";
+
+        document.getElementById("locationAnalytics")
+            .innerHTML =
+            data.locations.length
+            ? data.locations.map(x => `
+                <div>
+                    <span>${escapeHtml(x.location)}</span>
+                    <strong>${x.count}</strong>
+                </div>
+            `).join("")
+            : "<p>No data yet.</p>";
+
+    } catch(error) {
+        console.error(error);
+    }
+}
+
+
+async function loadNotifications() {
+    try {
+        const response =
+            await fetch("/api/notifications");
+
+        const data = await response.json();
+
+        const badge =
+            document.getElementById("notificationCount");
+
+        badge.innerText = data.unread;
+        badge.style.display =
+            data.unread ? "flex" : "none";
+
+        const list =
+            document.getElementById("notificationList");
+
+        if (!data.notifications.length) {
+            list.innerHTML =
+                "<p style='color:#718096;'>No notifications yet.</p>";
+            return;
+        }
+
+        list.innerHTML =
+            data.notifications.map(n => `
+                <div class="notification">
+                    <strong>${escapeHtml(n.notification_type)}</strong>
+                    <br>
+                    ${escapeHtml(n.message)}
+                    <br>
+                    <small>${escapeHtml(n.created_at)}</small>
+                </div>
+            `).join("");
+
+    } catch(error) {
+        console.error(error);
+    }
+}
+
+
+function toggleNotifications() {
+    const panel =
+        document.getElementById("notificationPanel");
+
+    panel.style.display =
+        panel.style.display === "block"
+        ? "none"
+        : "block";
+
+    loadNotifications();
+}
+
+
+async function markNotificationsRead() {
+    await fetch(
+        "/api/notifications/read",
+        {method:"PUT"}
+    );
+
+    loadNotifications();
+}
+
+
+function toggleDarkMode() {
+    document.body.classList.toggle("dark");
+
+    const dark =
+        document.body.classList.contains("dark");
+
+    localStorage.setItem(
+        "findlyDarkMode",
+        dark ? "1" : "0"
+    );
+
+    document.getElementById("themeButton")
+        .innerText = dark ? "☀️" : "🌙";
+}
+
+
+if (localStorage.getItem("findlyDarkMode") === "1") {
+    document.body.classList.add("dark");
+    document.getElementById("themeButton")
+        .innerText = "☀️";
+}
+
+
+document.getElementById("item_date").value =
+    new Date().toISOString().split("T")[0];
+
+loadItems();
+loadNotifications();
+loadAnalytics();
+</script>
+
+</body>
+</html>
+"""
+
+
+# =========================================================
+# START
+# =========================================================
+
+if __name__ == "__main__":
+    create_database()
+
+    port = int(os.environ.get("PORT", 5000))
+
+    print()
+    print("-------------------------------------------")
+    print(" FINDLY - SMART LOST & FOUND")
+    print("-------------------------------------------")
+    print(" Open: http://127.0.0.1:" + str(port))
+    print("-------------------------------------------")
+    print()
+
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=False,
+        use_reloader=False
+    )
+ 
